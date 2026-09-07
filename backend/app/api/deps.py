@@ -49,3 +49,22 @@ async def authorize_websocket(ws: WebSocket) -> bool:
     if not token_matches(settings, token):
         return False
     return True
+
+
+def require_local_browser(request: Request) -> None:
+    """Dashboard 路由用的校验：Dashboard 是用户直接在自己电脑的浏览器里打开的页面,
+    不经过插件、不需要配对 token。但对会改数据的 POST 请求,还是要挡一道最基本的
+    防线——防止用户打开的其他恶意网页用隐藏表单跨站提交到本地服务改数据。
+    做法：只要 Origin 不存在（同源导航常见情况）,或者 Origin 就是本地服务自己
+    （http://127.0.0.1:<port>），就放行；来自其他站点的 Origin 一律拒绝。
+    """
+    settings = get_settings()
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    expected = f"http://{settings.host}:{settings.port}"
+    if origin != expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="请求来源不是本地 Dashboard 页面本身，已拒绝",
+        )

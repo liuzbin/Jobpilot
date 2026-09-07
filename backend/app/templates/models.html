@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}模型配置 - JobPilot{% endblock %}
+{% block content %}
+<h1>模型配置</h1>
+<p class="muted">两个独立槽位：轻量模型用于简单的信息抽取（画像/JD 结构化），重量模型用于打分等更复杂的语义判断。只要是 OpenAI 兼容的 Chat Completions 接口都可以填（base_url 填到 /v1 这一级，比如 https://api.openai.com/v1）。</p>
+
+{% for slot in ['light', 'heavy'] %}
+<div class="card">
+  <h2>{{ '轻量模型' if slot == 'light' else '重量模型' }}（{{ slot }}）</h2>
+  <form method="post" action="/dashboard/models/{{ slot }}">
+    <label>Base URL</label>
+    <input type="text" name="base_url" value="{{ configs[slot].base_url or '' }}" placeholder="https://api.openai.com/v1">
+    <label>模型名称</label>
+    <input type="text" name="model_name" value="{{ configs[slot].model_name or '' }}" placeholder="gpt-4o-mini">
+    <label>API Key {% if configs[slot].has_key %}<span class="muted">(已设置，留空表示不修改)</span>{% endif %}</label>
+    <input type="password" name="api_key" placeholder="{% if configs[slot].has_key %}留空则保持不变{% else %}sk-...{% endif %}">
+    <div style="margin-top:16px;"><button type="submit">保存</button></div>
+  </form>
+</div>
+{% endfor %}
+{% endblock %}

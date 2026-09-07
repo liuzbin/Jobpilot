@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.routes_dashboard import router as dashboard_router
 from app.api.routes_system import router as system_router
 from app.core.config import get_settings
 from app.core.migrate import run_migrations
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="JobPilot Local App", version="0.1.0", lifespan=lifespan)
 app.include_router(system_router)
+app.include_router(dashboard_router)
 
 
 if __name__ == "__main__":

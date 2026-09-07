@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}我的画像 - JobPilot{% endblock %}
+{% block content %}
+<h1>我的画像</h1>
+
+<div class="card">
+  <h2>基本信息</h2>
+  <form method="post" action="/dashboard/profile">
+    <label>姓名</label>
+    <input type="text" name="full_name" value="{{ profile.full_name or '' }}">
+    <label>目标职位</label>
+    <input type="text" name="target_title" value="{{ profile.target_title or '' }}">
+    <label>学历</label>
+    <input type="text" name="education" value="{{ profile.education or '' }}">
+    <label>电话</label>
+    <input type="text" name="phone" value="{{ profile.phone or '' }}">
+    <label>邮箱</label>
+    <input type="email" name="email" value="{{ profile.email or '' }}">
+    <label>LinkedIn 链接</label>
+    <input type="url" name="linkedin_url" value="{{ profile.linkedin_url or '' }}">
+    <label>GitHub 链接</label>
+    <input type="url" name="github_url" value="{{ profile.github_url or '' }}">
+    <label>学校</label>
+    <input type="text" name="school" value="{{ profile.school or '' }}">
+    <label>工作经验年限</label>
+    <input type="number" step="0.5" name="years_experience" value="{{ profile.years_experience if profile.years_experience is not none else '' }}">
+    <label>当前所在地</label>
+    <input type="text" name="current_location" value="{{ profile.current_location or '' }}">
+    <label>目标工作所在地</label>
+    <input type="text" name="target_location" value="{{ profile.target_location or '' }}">
+    <label>工签/身份说明</label>
+    <input type="text" name="work_authorization" value="{{ profile.work_authorization or '' }}">
+    <div style="margin-top:16px;"><button type="submit">保存基本信息</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>上传简历自动建画像</h2>
+  <p class="muted">支持 .pdf / .docx / .txt / .md。解析走"轻量模型"槽位，请先在模型配置页面填好。基本信息只会填补空白字段，工作经历会自动合并去重。</p>
+  <form method="post" action="/dashboard/profile/resume" enctype="multipart/form-data">
+    <input type="file" name="resume_file" accept=".pdf,.docx,.txt,.md" required>
+    <div style="margin-top:12px;"><button type="submit">上传并解析</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>工作经历（{{ experience|length }} 家公司）</h2>
+  {% if not experience %}
+    <p class="muted">还没有工作经历数据，上传简历试试。</p>
+  {% endif %}
+  {% for company in experience %}
+    <div class="company-block">
+      <strong>{{ company.company_name }}</strong>
+      {% for pos in company.positions %}
+        <div class="position-block">
+          <div>{{ pos.position_title or '' }}{% if pos.project_name and pos.project_name != pos.position_title %} · {{ pos.project_name }}{% endif %}
+            <span class="muted">({{ pos.start_date or '?' }} ~ {{ pos.end_date or ('至今' if pos.is_current else '?') }})</span>
+          </div>
+          {% for b in pos.bullets %}
+            <div class="bullet">- {{ b.content }}</div>
+          {% endfor %}
+        </div>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  <p class="muted">逐条编辑/删除工作经历的界面留到 Phase 2 做，目前只能通过重新上传简历来增量补充。</p>
+</div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}投递列表 - JobPilot{% endblock %}
+{% block content %}
+<h1>投递列表</h1>
+<p><a class="btn" href="/dashboard/jobs/new">+ 新增 JD</a></p>
+
+<div class="card">
+  {% if not jobs %}
+    <p class="muted">还没有 JD，点上面按钮粘贴一条试试。</p>
+  {% else %}
+  <table>
+    <thead><tr><th>公司</th><th>岗位</th><th>状态</th><th>总分</th><th>创建时间</th><th></th></tr></thead>
+    <tbody>
+      {% for jd, score in jobs %}
+      <tr>
+        <td>{{ jd.company or '-' }}</td>
+        <td>{{ jd.title or '-' }}</td>
+        <td><span class="status-badge status-{{ jd.status.value }}">{{ status_labels[jd.status.value] }}</span></td>
+        <td>{{ '%.0f'|format(score.total_score) if score else '-' }}</td>
+        <td class="muted">{{ jd.created_at.strftime('%Y-%m-%d %H:%M') if jd.created_at else '-' }}</td>
+        <td><a href="/dashboard/jobs/{{ jd.id }}">查看</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endblock %}

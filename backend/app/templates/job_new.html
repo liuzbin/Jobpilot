@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}新增 JD - JobPilot{% endblock %}
+{% block content %}
+<h1>新增 JD</h1>
+<div class="card">
+  <form method="post" action="/dashboard/jobs">
+    <label>公司</label>
+    <input type="text" name="company">
+    <label>岗位</label>
+    <input type="text" name="title">
+    <label>地点</label>
+    <input type="text" name="location">
+    <label>来源链接（可选）</label>
+    <input type="url" name="source_url">
+    <label>JD 正文（岗位描述/职责/要求，从 LinkedIn 等网站复制粘贴）</label>
+    <textarea name="description_raw" required placeholder="把 About the job 那一整段贴进来"></textarea>
+    <label>附加信息（可选，比如 "Toronto, ON · 2 weeks ago · 80 people clicked apply Promoted by hirer · Responses managed off LinkedIn"）</label>
+    <textarea name="extra_meta_raw" style="min-height:60px;"></textarea>
+    <div style="margin-top:16px;"><button type="submit">保存</button></div>
+  </form>
+</div>
+{% endblock %}
