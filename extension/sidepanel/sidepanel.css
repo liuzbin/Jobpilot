@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  font-size: 14px;
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0 0 12px 0;
+}
+
+.card {
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-disconnected { background: #d33; }
+.dot-connecting { background: #e0a300; }
+.dot-connected { background: #2ea043; }
+.dot-pairing_rejected { background: #d33; }
+.dot-app_detected_unpaired { background: #e0a300; }
+
+.detail {
+  margin-top: 6px;
+  color: #888;
+  font-size: 12px;
+  min-height: 16px;
+}
+
+.hint {
+  color: #888;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.input-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+input[type="text"] {
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+}
+
+button {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  background: rgb(37, 99, 235);
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+button:hover {
+  opacity: 0.9;
+}
+
+code {
+  background: rgba(127, 127, 127, 0.15);
+  padding: 1px 4px;
+  border-radius: 4px;
+}

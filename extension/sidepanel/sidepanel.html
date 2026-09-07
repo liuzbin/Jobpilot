@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>JobPilot</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header>
+      <h1>JobPilot</h1>
+    </header>
+
+    <section id="status-card" class="card">
+      <div class="status-row">
+        <span id="status-dot" class="dot dot-disconnected"></span>
+        <span id="status-text">检测中…</span>
+      </div>
+      <div id="status-detail" class="detail"></div>
+      <button id="retry-btn" type="button">重新检测</button>
+    </section>
+
+    <section id="pairing-card" class="card" hidden>
+      <h2>配对本地 App</h2>
+      <p class="hint">
+        已经检测到本地 App，请打开配对页面复制配对码，粘贴到下面完成配对。
+      </p>
+      <button id="open-pair-page-btn" type="button">打开本地配对页面</button>
+      <div class="input-row">
+        <input id="token-input" type="text" placeholder="粘贴配对码" />
+        <button id="save-token-btn" type="button">保存并连接</button>
+      </div>
+    </section>
+
+    <section id="not-detected-card" class="card" hidden>
+      <h2>还没检测到本地 App</h2>
+      <p class="hint">
+        JobPilot 需要配合本地常驻程序使用。请先按照项目 README 的说明启动本地
+        App（开发阶段：<code>uvicorn app.main:app</code>），启动后本插件会自动检测到。
+      </p>
+    </section>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

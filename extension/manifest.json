@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "JobPilot",
+  "version": "0.1.0",
+  "description": "JobPilot 求职助手插件：与本地 App 配合完成画像维护、JD 打分、简历重制与投递辅助。",
+  "permissions": ["sidePanel", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1:8756/*"],
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "action": {
+    "default_title": "打开 JobPilot"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
