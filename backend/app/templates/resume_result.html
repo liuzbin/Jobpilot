@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}简历版本 - JobPilot{% endblock %}
+{% block content %}
+<p><a href="/dashboard/jobs/{{ jd.id }}">&larr; 返回 JD 详情</a></p>
+<h1>简历版本（K={{ resume_version.k_value }}）</h1>
+<p class="muted">{{ jd.company or '' }} · {{ jd.title or '' }} · 生成时间 {{ resume_version.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+
+<div class="card">
+  <h2>Markdown 预览</h2>
+  <p class="muted">PDF / 简历风格模板渲染留待后续增量实现，目前先提供结构化数据和 Markdown 预览。</p>
+  <pre style="white-space:pre-wrap; font-family:inherit; font-size:13px;">{{ resume_version.markdown_text }}</pre>
+</div>
+
+<div class="card">
+  <h2>结构化数据（resume_json）</h2>
+  <pre style="white-space:pre-wrap; font-family:inherit; font-size:12px; color:#555;">{{ resume_version.resume_json | tojson(indent=2) }}</pre>
+</div>
+{% endblock %}

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}{{ position.position_title or '项目详情' }} - JobPilot{% endblock %}
+{% block content %}
+<p><a href="/dashboard/profile">&larr; 返回画像</a></p>
+<h1>{{ company_name or '' }}{% if company_name %} · {% endif %}{{ position.position_title or '' }}
+  {% if position.project_name and position.project_name != position.position_title %} · {{ position.project_name }}{% endif %}
+</h1>
+<p class="muted">{{ position.start_date or '?' }} ~ {{ position.end_date or ('至今' if position.is_current else '?') }}</p>
+
+<div class="card">
+  <h2>贡献句（{{ position.bullets|length }} 条）</h2>
+  {% for b in position.bullets %}
+    <div class="bullet-block">
+      <div class="bullet">- {{ b.content }}</div>
+      {% if b.keywords %}
+        <div class="tags">
+          {% for kw in b.keywords %}<span class="tag">{{ kw }}</span>{% endfor %}
+        </div>
+      {% else %}
+        <div class="muted" style="font-size:12px;">尚未提炼关键词（下次上传/深化简历时会自动补跑）</div>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="muted">还没有贡献句。</p>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>项目背景与理解</h2>
+  <p class="muted">这段描述不会出现在最终简历上，只是给简历重制阶段判断"某个 JD 要求的技能是否和这个项目的技术背景相关"提供依据，越具体，后面生成的技能延伸建议就越靠谱。</p>
+  {% if position.background_notes %}
+    <p>{{ position.background_notes }}</p>
+  {% else %}
+    <p class="muted">还没有背景描述，点下面的按钮开始一轮追问式访谈。</p>
+  {% endif %}
+  <form method="get" action="/dashboard/profile/positions/{{ position.id }}/interview">
+    <button type="submit">深化这段经历</button>
+  </form>
+
+  {% if position.background_qa %}
+    <h2 style="margin-top:24px;">历史访谈记录</h2>
+    {% for qa in position.background_qa %}
+      <div class="qa-item">
+        <div class="qa-question">Q: {{ qa.question }}</div>
+        <div class="qa-answer">A: {{ qa.answer }}</div>
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}

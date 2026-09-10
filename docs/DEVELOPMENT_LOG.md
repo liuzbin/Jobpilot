@@ -127,3 +127,46 @@
 `backend/requirements.txt`、`backend/app/main.py`、`backend/app/api/deps.py`、`backend/app/api/deps_llm.py`、`backend/app/api/routes_dashboard.py`、`backend/app/core/secrets.py`、`backend/app/core/llm_client.py`、`backend/app/core/llm_factory.py`、`backend/app/services/`（新增目录：`profile_service.py`、`resume_ingest.py`、`jd_ingest.py`、`scoring.py`、`analysis.py`）、`backend/app/templates/`（新增：`base.html`、`profile.html`、`jobs_list.html`、`job_new.html`、`job_detail.html`、`models.html`）、`backend/tests/conftest.py`、`backend/tests/test_profile_service.py`、`backend/tests/test_jd_ingest.py`、`backend/tests/test_scoring.py`、`backend/tests/test_dashboard.py`
 
 ---
+## Phase 2：画像深化（追问式访谈 + 关键词三元组）+ K 值驱动的简历重制与技能延伸确认（2026-09-08 ~ 2026-09-10）
+
+### 目标
+
+在写代码之前先和用户完整讨论清楚了这个 Phase 要解决的真实问题：单薄的简历 bullet 撑不起"既贴合实际又贴合 JD"的简历重制，需要更深的项目背景输入，也需要让 AI 能识别"JD 要求的技能和用户真实项目技术背景高度相关、值得作为可主动突击学习的延伸"这种情况。讨论中用户明确了一条本 Phase 必须落地、且要写进实施方案文档的核心价值主张：**JobPilot 不是单纯的效率工具，而是帮用户看清并补齐自己能力相对市场需求短板的工具**——这条价值主张直接决定了本 Phase 几乎每一个设计取舍：延伸建议必须给理由、必须用户逐条确认才能进简历、且延伸建议永远不能反向影响客观打分（打分脏了，用户就没法准确看清自己真实的差距）。
+
+按用户要求的顺序，本 Phase 先把《JobPilot 实施方案》文档更新到 v2（新增"核心价值主张"章节，补全 Phase 2 详细设计），提交推送到 GitHub 之后，才开始写 Phase 2 的代码。
+
+### 实现内容
+
+- **数据模型扩展**：`ExperienceEntry` 新增 `background_notes`（AI 整理后的背景描述文本）、`background_qa`（原始问答历史，JSON 数组，保留审计追溯）；`ExperienceBullet` 新增 `keywords`/`action_summary`/`result_summary` 三个字段，对应"关键词 + 行为 + 结果"三元组，`content` 原文永远保持不变作为唯一真值，三元组是可重新计算的派生索引。新增 `ClaimedSkill` 表（技能名、所属经历、行为/结果摘要、生成理由、来源 JD、创建/更新时间），作为跨 JD 复用的"已确认、现在真的要去学"技能清单。迁移脚本 `3eea4bce52ea_phase2_profile_depth_and_claimed_skill.py` 用 `alembic revision --autogenerate` 生成后逐项核对确认与模型改动完全对应。
+- **画像深化服务**（`app/services/profile_deepening.py`）：`extract_bullet_triads()` 把一批 bullet 原文交给轻量模型批量抽取三元组，对模型返回数量少于输入的情况做防御性补空，保证顺序和数量始终和输入对齐；`backfill_bullet_triads()` 只处理 `keywords is None` 的 bullet（按经历分组批量调用），避免重复抽取浪费调用次数；`generate_background_questions()` 根据已有的职位/项目/bullet 内容生成针对性追问，而不是甩给用户一个空白大文本框；`merge_background_answers()` 把多轮问答整合成连贯的背景描述文本（空白答案自动跳过、本轮全部跳过则不调用模型），原始问答历史累积保留在 `background_qa` 里。
+- **简历重制服务**（`app/services/resume_tailor.py`，本 Phase 的核心）：`collect_jd_keywords()` / `find_missing_keywords()` / `find_hit_bullets()` 找出 JD 要求的技能里哪些在用户真实经历里有直接命中、哪些完全缺失；`select_keywords_to_extend()` 是纯函数，按 `ceil(缺失技能数 × K / 10)` 确定性地从缺失技能里选出本次要生成延伸建议的数量，K 值越大延伸范围越大；`rewrite_hit_bullets()` 把命中的真实 bullet 按三元组重新组织表达，不编造内容；`generate_extension_suggestions()` 调重量模型，对每个候选缺失技能要求模型给出"是否技术背景上站得住脚（plausible）+ 具体理由 + 对应哪段真实经历 + 校准过的行为和结果摘要"，不合理（`plausible=false`）或者经历下标非法的建议会被直接过滤掉，不会展示给用户。`build_resume_draft()` 把上面这些串成一份草稿；`confirm_and_finalize()` 是唯一的写入口——只有用户在页面上逐条勾选确认过的延伸建议才会真正进入生成的简历内容，同时 upsert 进 `ClaimedSkill` 表（按技能名+经历去重，不重复插入）。整个 `resume_tailor.py` 模块开头用文档字符串明确写死一条约束：这个模块产出的任何东西都不会被 `compute_score()` 读取。
+- **Dashboard 界面**：新增"经历详情"页（展示 bullet 的关键词标签、背景描述、历史问答，"深化这段经历"入口）、"追问式访谈"页（渲染生成的问题列表，大文本框自由作答）、"简历草稿"页（K 值输入，只读的命中项展示，每条延伸建议一个"勾选是否采纳 + 可编辑的关键词/行为/结果/理由"区块）、"简历结果"页（Markdown 预览 + 结构化 JSON）。草稿页的状态传递没有用 session，走的是无状态服务端渲染的老套路：GET 计算草稿、把命中项打包成一个隐藏的 JSON 字段和一组按下标编号的延伸建议字段一起渲染出来，POST 确认时用 `await request.form()` 手动解析这些变长的按下标字段（不用 FastAPI 的 `Form(...)` 类型参数，因为延伸建议条数是动态的）。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **画像深化访谈是手动触发，不是上传简历后自动弹出**：用户在讨论里认可了这个推荐方案——追问式访谈需要用户投入认真作答的精力，自动弹出容易打断用户本来想做的"先看看画像对不对"的流程，改成经历详情页里一个明确的"深化这段经历"按钮，用户自己决定什么时候投入时间来做这件事。
+2. **关键词三元组只在"没有的时候"才抽取，抽取过和 bullet 原文本身修改后都不做自动失效重算**：本 Phase 先解决"从无到有"，如果用户后续手动编辑了 bullet 原文，三元组要不要跟着自动重新抽取，这类"编辑联动"逻辑留给后续 Phase（目前也还没有 bullet 编辑功能）。
+3. **`ClaimedSkill` 和打分引擎之间是单向且永久的隔断，不是"可以配置的开关"**：这条不是性能或者复杂度上的简化，而是直接对应用户强调的核心价值——如果延伸建议、哪怕是用户已经确认要去学的技能，能够反过来影响 `compute_score()` 的客观打分，用户就没法再通过这个分数看清自己和 JD 真实要求之间的差距，"诚实地暴露短板"这条核心价值就会被破坏。所以特意没有做成一个"要不要把已认领技能计入打分"的可配置项，写了一条独立的回归测试（`test_claimed_skill_does_not_affect_scoring`）钉死这个边界。
+
+### 遇到的问题与解决
+
+**问题一：`FakeLLMClient` 按调用顺序弹出预设响应，和测试 fixture 复用之间产生了一次隐蔽的对不上号**
+
+现象：新写的 `test_tailor_draft_and_confirm_full_flow`（`backend/tests/test_dashboard.py`）跑起来时，`assert "Spark" in r.text` 失败——草稿页命中项和延伸建议都是空的。
+
+原因是三层叠在一起的：(1) 这条测试最初复用了已有的 `_seed_jd_with_score(client)` 辅助函数，它会先跑一次 `POST /jobs/{id}/analyze`，用共享的 `FAKE_JD_EXTRACTION_RESPONSE`（`key_skills=["Python","SQL"]`）把结果缓存进了 `jd.parsed_meta`；而 `build_resume_draft()` 为了避免重复解析同一份 JD，有一段"`parsed_meta` 里已经有 `key_skills` 就直接复用缓存，不再调用 `structure_jd_text()`"的逻辑——这条缓存判断悄悄短路掉了测试自己准备的、`key_skills=["Hadoop","Spark","RAG"]` 的 `jd_parse_fake`，实际生效的一直是 Python/SQL，和任何真实 bullet 都不命中，也不缺失任何"该延伸"的技能。(2) 因为没有命中的 bullet，`rewrite_hit_bullets([])` 直接空返回、根本没消费掉排在队列前面那条"重写后 bullet"形状的预设响应；(3) `FakeLLMClient` 的语义是"不管是哪个 prompt 触发的调用，一律按顺序弹队列里下一条"，于是这条本该给重写步骤用的响应，被紧随其后的 `generate_extension_suggestions()` 调用错误地当成了自己的响应消费掉，取出来的 JSON 形状对不上，`result.get("suggestions")` 拿到的是 `None`。排查过程中还确认了一个此前的误判：`_seed_position_via_upload` 辅助函数灌进去的是"Payments"主题的简历内容（Acme Corp / Backend Engineer / Payments，bullet 是"支付服务"和"延迟降低 30%"），并不是我最初以为的、混进来自某个早期独立冒烟测试的 Hadoop/ETL 内容。
+
+解决：把这条测试改成不经过 `_seed_jd_with_score`，直接 `POST /dashboard/jobs` 建一条全新的 JD 记录（跳过预先分析这一步），保证 `build_resume_draft()` 一定会自己调用 `structure_jd_text()`、吃到测试准备的 `jd_parse_fake`；同时把 `jd_parse_fake` 的 `key_skills` 故意设成和已灌入的 Payments bullet 毫无关联的 `["Spark", "RAG"]`，让"零命中"这个前提是设计出来的，而不是依赖 bullet 关键词匹配的偶然结果；GET 请求的 `k` 参数从 5 改成 10，保证两个缺失技能都进入延伸建议的候选池；重量模型的预设响应从"重写 + 延伸"两条精简成"延伸"一条，因为零命中的情况下 `rewrite_hit_bullets` 根本不会触发模型调用。修完之后完整跑了一遍全部用例确认转绿，也顺带把这条踩坑记录下来，提醒以后写涉及 `FakeLLMClient` 的测试时，任何"缓存/短路"逻辑都可能让准备好的预设响应从未被真正消费，进而错位到后面的调用上——这类问题只看"最终响应内容对不对"很难发现，得回头看"到底是不是预期的那次调用消费了它"。
+
+### 验证结果
+
+- 新增 2 个 pytest 文件（`test_profile_deepening.py` 9 条、`test_resume_tailor.py` 18 条），扩展 `test_dashboard.py`（新增 8 条，覆盖经历详情/追问式访谈路由、简历草稿生成与确认全流程、模型未配置时的友好提示、访问不存在的简历版本返回 404），加上 Phase 0/1 遗留的 56 条，`backend` 目录下共 **93 条 pytest 用例全部通过**。
+- 专门写了 `test_claimed_skill_does_not_affect_scoring` 回归测试：用完全相同的打分相关预设输入，对比"存在一条已确认的 `ClaimedSkill`"和"不存在"两种情况下 `compute_score()` 的输出，确认分数完全一致，钉死"已认领技能永不影响客观打分"这条对应核心价值主张的硬约束。
+- 延伸建议确认流程有专门测试（`test_tailor_confirm_rejects_unaccepted_suggestions`）验证"AI 提议的东西不会未经确认就悄悄写进简历"。
+- 先在云端沙盒环境跑通全部 93 条用例，再把新增/修改的 15 个文件打包同步到用户本机项目目录（`C:\liuzhibin\aI-agent\jobpilot`），逐文件核对 SHA-256 校验和确认同步无损坏，在设备桥接的 Linux 执行环境里（复用 Phase 1 收尾时建好的独立 Linux 虚拟环境）重新装一遍依赖、重新跑一遍全部 93 条用例，结果一致。数据库结构升级走的是本地 App 启动时自动执行的 `run_migrations()`（`app/core/migrate.py`），本 Phase 新增的迁移会在用户下次启动本地 App 时自动应用，不需要手动跑 alembic 命令。
+
+### 涉及文件
+
+`docs/JobPilot_实施方案.md`（v2，新增"核心价值主张"章节 + Phase 2 详细设计）、`backend/app/models/tables.py`、`backend/alembic/versions/3eea4bce52ea_phase2_profile_depth_and_claimed_skill.py`、`backend/app/services/profile_deepening.py`（新增）、`backend/app/services/resume_tailor.py`（新增）、`backend/app/api/routes_dashboard.py`、`backend/app/templates/position_detail.html`（新增）、`backend/app/templates/position_interview.html`（新增）、`backend/app/templates/resume_tailor.html`（新增）、`backend/app/templates/resume_result.html`（新增）、`backend/app/templates/base.html`、`backend/app/templates/profile.html`、`backend/app/templates/job_detail.html`、`backend/tests/test_profile_deepening.py`（新增）、`backend/tests/test_resume_tailor.py`（新增）、`backend/tests/test_dashboard.py`
+
+---

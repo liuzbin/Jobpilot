@@ -94,6 +94,14 @@ class ExperienceEntry(Base):
     end_date: Mapped[str | None] = mapped_column(String(20))
     is_current: Mapped[bool] = mapped_column(default=False)
 
+    # Phase 2 新增：项目背景与理解（见实施方案 4/5.1）。不是让用户对着空文本框
+    # 写作文，而是通过"追问式访谈"逐步填充——background_qa 存原始问答，
+    # background_notes 存系统整理出的连贯文本，是简历重制阶段判断"某个
+    # JD 要求的技能和这个项目的技术背景是否相关"时的主要依据。
+    background_notes: Mapped[str | None] = mapped_column(Text)
+    # [{"question": "...", "answer": "..."}, ...]，按访谈轮次追加
+    background_qa: Mapped[list | None] = mapped_column(JSON)
+
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -108,6 +116,9 @@ class ExperienceEntry(Base):
     )
     bullets: Mapped[list["ExperienceBullet"]] = relationship(
         back_populates="position", cascade="all, delete-orphan"
+    )
+    claimed_skills: Mapped[list["ClaimedSkill"]] = relationship(
+        back_populates="experience_entry", cascade="all, delete-orphan"
     )
 
 
@@ -125,6 +136,14 @@ class ExperienceBullet(Base):
     # 目的是单独把这一句话喂给 LLM 时,不必再反查父级也能带上完整上下文
     tags: Mapped[list | None] = mapped_column(JSON)
     embedding: Mapped[bytes | None] = mapped_column(LargeBinary)
+
+    # Phase 2 新增：从 content 抽取出的"关键词 + 行为 + 结果"三元组衍生字段
+    # （见实施方案 4/5.1）。content 本身不变、永远是唯一的事实来源；这三个
+    # 字段只是从它提炼出来、用于简历重制阶段做关键词匹配和内容重组的索引。
+    keywords: Mapped[list | None] = mapped_column(JSON)  # ["Spark", "ETL", ...]
+    action_summary: Mapped[str | None] = mapped_column(Text)
+    result_summary: Mapped[str | None] = mapped_column(Text)
+
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -230,6 +249,41 @@ class QABankEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
+
+
+class ClaimedSkill(Base):
+    """认领技能库（Phase 2 新增，见实施方案 4/5.3）：用户在简历重制时对"延伸建议"
+    逐条确认接受之后，持久化在这里，供以后别的 JD 复用。每一条都是一套完整的
+    "关键词 + 行为 + 结果"三元组模板，而不只是一个技能名——单独一个技能名没法
+    直接用于写简历，也没法在面试里讲清楚。
+
+    这张表的内容明确不参与 app.services.scoring.compute_score 的打分计算：
+    打分要对用户保持诚实，不能因为"认领了"某项技能就让匹配分数上涨，否则
+    "帮用户看清楚自己和市场的真实差距"这条核心价值就无从谈起（见实施方案
+    第一节"核心价值主张"）。
+    """
+
+    __tablename__ = "claimed_skill"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    skill_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    experience_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("experience_entry.id", ondelete="CASCADE"), nullable=False
+    )
+    action_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    result_summary: Mapped[str | None] = mapped_column(Text)
+    # 为什么认为这项技能和这个项目的技术背景相关（呈现给用户确认时的依据）
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    # 第一次触发这条建议的 JD，JD 被删除不影响这条认领记录本身
+    source_jd_id: Mapped[int | None] = mapped_column(
+        ForeignKey("jd_record.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+    experience_entry: Mapped[ExperienceEntry] = relationship(back_populates="claimed_skills")
 
 
 class ModelConfig(Base):

@@ -42,6 +42,27 @@
 </div>
 {% endif %}
 
+{% if score %}
+<div class="card">
+  <h2>生成定制简历</h2>
+  <p class="muted">K 值决定"技能延伸"的幅度：K=0 只重排真实内容；K 越大，尝试为越多缺失技能生成延伸建议，但延伸建议需要你在下一步逐条确认才会真正写进简历，不会自动生效。</p>
+  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor">
+    <label>K 值（0-10）</label>
+    <input type="number" name="k" min="0" max="10" value="5" style="width:100px; display:inline-block;">
+    <button type="submit">生成简历草稿</button>
+  </form>
+</div>
+{% endif %}
+
+{% if jd.resume_versions %}
+<div class="card">
+  <h2>历史简历版本</h2>
+  {% for rv in jd.resume_versions|sort(attribute='created_at', reverse=True) %}
+    <div class="breakdown-item"><a href="/dashboard/jobs/{{ jd.id }}/resumes/{{ rv.id }}">K={{ rv.k_value }} · {{ rv.created_at.strftime('%Y-%m-%d %H:%M') }}</a></div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div class="card">
   <h2>JD 原文</h2>
   <pre style="white-space:pre-wrap; font-family:inherit; font-size:13px;">{{ jd.description_raw }}</pre>

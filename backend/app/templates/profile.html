@@ -53,16 +53,17 @@
       <strong>{{ company.company_name }}</strong>
       {% for pos in company.positions %}
         <div class="position-block">
-          <div>{{ pos.position_title or '' }}{% if pos.project_name and pos.project_name != pos.position_title %} · {{ pos.project_name }}{% endif %}
+          <div><a href="/dashboard/profile/positions/{{ pos.id }}">{{ pos.position_title or '' }}{% if pos.project_name and pos.project_name != pos.position_title %} · {{ pos.project_name }}{% endif %}</a>
             <span class="muted">({{ pos.start_date or '?' }} ~ {{ pos.end_date or ('至今' if pos.is_current else '?') }})</span>
           </div>
           {% for b in pos.bullets %}
             <div class="bullet">- {{ b.content }}</div>
           {% endfor %}
+          <div class="muted" style="font-size:12px; margin-top:4px;"><a href="/dashboard/profile/positions/{{ pos.id }}">查看项目背景 / 深化这段经历 &rarr;</a></div>
         </div>
       {% endfor %}
     </div>
   {% endfor %}
-  <p class="muted">逐条编辑/删除工作经历的界面留到 Phase 2 做，目前只能通过重新上传简历来增量补充。</p>
+  <p class="muted">逐条编辑/删除工作经历的界面留到后续做，目前只能通过重新上传简历来增量补充，或者点进某段经历去"深化"背景描述。</p>
 </div>
 {% endblock %}

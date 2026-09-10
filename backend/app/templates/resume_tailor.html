@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}生成简历 - JobPilot{% endblock %}
+{% block content %}
+<p><a href="/dashboard/jobs/{{ jd.id }}">&larr; 返回 JD 详情</a></p>
+<h1>生成简历：{{ jd.company or '' }} · {{ jd.title or '' }}</h1>
+
+<div class="card">
+  <h2>K 值：{{ k_value }}</h2>
+  <p class="muted">K=0 只重排真实内容，不做技能延伸；K 越大，尝试为越多"JD 要但画像里没有真实证据"的技能生成延伸建议，但延伸建议永远需要你逐条确认才会真正进入简历。</p>
+  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor">
+    <label>调整 K 值重新生成草稿（0-10）</label>
+    <input type="number" name="k" min="0" max="10" value="{{ k_value }}" style="width:100px; display:inline-block;">
+    <button type="submit" class="secondary">重新生成草稿</button>
+  </form>
+</div>
+
+<form method="post" action="/dashboard/jobs/{{ jd.id }}/tailor/confirm">
+  <input type="hidden" name="k_value" value="{{ k_value }}">
+  <input type="hidden" name="hit_items_json" value='{{ hit_items_json }}'>
+  <input type="hidden" name="suggestion_count" value="{{ suggestions|length }}">
+
+  <div class="card">
+    <h2>命中的真实经历（{{ hit_items|length }} 条，无需确认，直接采用）</h2>
+    {% if not hit_items %}
+      <p class="muted">这份 JD 要求的关键词，在你画像的贡献句里一条都没直接命中。可能是简历还没做过"关键词提炼"（重新上传一次简历，或去项目详情页补充经历），也可能这些关键词确实是你目前经历里没有的。</p>
+    {% endif %}
+    {% for item in hit_items %}
+      <div class="bullet-block">
+        <div class="muted" style="font-size:12px;">{{ item.company_name or '' }} · {{ item.position_title or '' }}{% if item.project_name %} · {{ item.project_name }}{% endif %} · 命中关键词：{{ item.matched_keywords|join(', ') }}</div>
+        <div class="bullet">- {{ item.action_summary }}{% if item.result_summary %}，{{ item.result_summary }}{% endif %}</div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>技能延伸建议（{{ suggestions|length }} 条，需逐条确认）</h2>
+    {% if not suggestions %}
+      <p class="muted">{% if k_value == 0 %}K=0 不做技能延伸。{% else %}当前 K 值下没有生成延伸建议——要么所有缺失的关键词都找不到合理相关的项目背景，要么这份 JD 要求的技能你已经都命中了。{% endif %}</p>
+    {% endif %}
+    {% for s in suggestions %}
+      <div class="suggestion-block">
+        <label style="display:inline;"><input type="checkbox" name="accept_{{ loop.index0 }}" style="width:auto; display:inline;"> 采纳这条建议</label>
+        <input type="hidden" name="keyword_{{ loop.index0 }}" value="{{ s.keyword }}">
+        <input type="hidden" name="entry_{{ loop.index0 }}" value="{{ s.experience_entry_id }}">
+        <input type="hidden" name="rationale_{{ loop.index0 }}" value="{{ s.rationale }}">
+        <div class="muted" style="font-size:12px; margin-top:6px;">关键词：{{ s.keyword }} · 关联经历：{{ s.position_title or '' }}{% if s.project_name %} · {{ s.project_name }}{% endif %}</div>
+        <div class="muted" style="font-size:12px;">判断依据：{{ s.rationale }}</div>
+        <label>行为（可编辑）</label>
+        <textarea name="action_{{ loop.index0 }}" style="min-height:50px;">{{ s.action_summary }}</textarea>
+        <label>结果（可编辑）</label>
+        <textarea name="result_{{ loop.index0 }}" style="min-height:40px;">{{ s.result_summary or '' }}</textarea>
+        <p class="muted" style="font-size:12px;">采纳这条建议之后，它会被存进"认领技能库"，提醒自己后续针对这项技能做真实的知识补齐。</p>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <button type="submit">生成简历</button>
+  </div>
+</form>
+{% endblock %}
