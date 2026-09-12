@@ -8,10 +8,37 @@
 <p class="muted">{{ position.start_date or '?' }} ~ {{ position.end_date or ('至今' if position.is_current else '?') }}</p>
 
 <div class="card">
+  <h2>编辑这段职位信息</h2>
+  <form method="post" action="/dashboard/profile/positions/{{ position.id }}/update">
+    <label>职位名称</label>
+    <input type="text" name="position_title" value="{{ position.position_title or '' }}">
+    <label>项目名称</label>
+    <input type="text" name="project_name" value="{{ position.project_name or '' }}">
+    <label>起始时间</label>
+    <input type="text" name="start_date" value="{{ position.start_date or '' }}" placeholder="2022-01">
+    <label>结束时间</label>
+    <input type="text" name="end_date" value="{{ position.end_date or '' }}" placeholder="留空表示至今">
+    <label><input type="checkbox" name="is_current" value="1" {% if position.is_current %}checked{% endif %}> 目前在职</label>
+    <div style="margin-top:8px;"><button type="submit">保存</button></div>
+  </form>
+  <form method="post" action="/dashboard/profile/positions/{{ position.id }}/delete" style="margin-top:12px;" onsubmit="return confirm('确定要删除这段职位经历吗？下面的贡献句也会一起删除。');">
+    <button type="submit" class="secondary">删除这段职位经历</button>
+  </form>
+</div>
+
+<div class="card">
   <h2>贡献句（{{ position.bullets|length }} 条）</h2>
   {% for b in position.bullets %}
     <div class="bullet-block">
-      <div class="bullet">- {{ b.content }}</div>
+      <form method="post" action="/dashboard/profile/bullets/{{ b.id }}/update">
+        <input type="hidden" name="position_id" value="{{ position.id }}">
+        <textarea name="content" rows="2" style="width:100%;">{{ b.content }}</textarea>
+        <div style="margin-top:4px;"><button type="submit" style="font-size:12px; padding:2px 8px;">保存修改</button></div>
+      </form>
+      <form method="post" action="/dashboard/profile/bullets/{{ b.id }}/delete" style="display:inline;" onsubmit="return confirm('确定要删除这条贡献句吗？');">
+        <input type="hidden" name="position_id" value="{{ position.id }}">
+        <button type="submit" class="secondary" style="font-size:12px; padding:2px 8px;">删除</button>
+      </form>
       {% if b.keywords %}
         <div class="tags">
           {% for kw in b.keywords %}<span class="tag">{{ kw }}</span>{% endfor %}
@@ -23,6 +50,14 @@
   {% else %}
     <p class="muted">还没有贡献句。</p>
   {% endfor %}
+
+  <details style="margin-top:12px;">
+    <summary class="muted" style="cursor:pointer; font-size:13px;">新增一条贡献句</summary>
+    <form method="post" action="/dashboard/profile/positions/{{ position.id }}/bullets" style="margin-top:8px;">
+      <textarea name="content" rows="2" style="width:100%;" placeholder="用一句话描述一项具体贡献" required></textarea>
+      <div style="margin-top:8px;"><button type="submit">新增</button></div>
+    </form>
+  </details>
 </div>
 
 <div class="card">

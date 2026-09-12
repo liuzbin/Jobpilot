@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{ resume.basic.full_name or "简历" }}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm;
+  }
+  body {
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "SimSun", Arial, sans-serif;
+    font-size: 10.5pt;
+    color: #1a1a1a;
+    line-height: 1.5;
+    margin: 0;
+  }
+  h1 {
+    font-size: 18pt;
+    margin: 0 0 2mm 0;
+  }
+  .target-title {
+    font-size: 11pt;
+    color: #444;
+    margin: 0 0 1mm 0;
+  }
+  .contact {
+    font-size: 9pt;
+    color: #555;
+    margin: 0 0 6mm 0;
+  }
+  h2 {
+    font-size: 12pt;
+    border-bottom: 1pt solid #ccc;
+    padding-bottom: 1mm;
+    margin: 6mm 0 3mm 0;
+  }
+  .position-block {
+    margin-bottom: 4mm;
+    break-inside: avoid;
+  }
+  .position-header {
+    font-weight: bold;
+    font-size: 10.5pt;
+  }
+  ul.bullets {
+    margin: 1mm 0 0 0;
+    padding-left: 5mm;
+  }
+  ul.bullets li {
+    margin-bottom: 1mm;
+  }
+  .empty-note {
+    color: #888;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+  <h1>{{ resume.basic.full_name or "（未填写姓名）" }}</h1>
+  {% if resume.basic.target_title %}
+  <p class="target-title">{{ resume.basic.target_title }}</p>
+  {% endif %}
+  <p class="contact">{{ [resume.basic.email, resume.basic.phone] | select | join(" · ") }}</p>
+
+  <h2>工作经历</h2>
+  {% for position in resume.experience %}
+    <div class="position-block">
+      <div class="position-header">{{ [position.position_title, position.project_name] | select | join(" / ") }}</div>
+      <ul class="bullets">
+        {% for item in position['items'] %}
+          <li>{{ item.action_summary }}{% if item.result_summary %}，{{ item.result_summary }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% else %}
+    <p class="empty-note">（本版本没有命中任何真实经历或已确认的延伸建议）</p>
+  {% endfor %}
+</body>
+</html>

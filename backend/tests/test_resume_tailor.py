@@ -18,6 +18,7 @@ from app.services.profile_deepening import merge_background_answers
 from app.services.profile_service import merge_parsed_experience, update_profile_basic
 from app.services.resume_tailor import (
     JDNotFoundError,
+    _batch_validate_facts,
     build_resume_draft,
     collect_jd_keywords,
     confirm_and_finalize,
@@ -26,6 +27,7 @@ from app.services.resume_tailor import (
     generate_extension_suggestions,
     rewrite_hit_bullets,
     select_keywords_to_extend,
+    validate_item_facts,
 )
 
 
@@ -141,6 +143,152 @@ def test_rewrite_hit_bullets_falls_back_to_original_when_model_omits_fields(db_s
     assert rewritten[0]["result_summary"] == hits[0]["result_summary"]
 
 
+# ---------- 事实字段护栏校验 ----------
+
+
+def test_validate_item_facts_rule_layer_catches_injected_fake_company():
+    """自测方法里明确要求的场景：故意在生成文本里注入一个不存在的公司名，
+    断言护栏能拦截——规则层本身就是纯字符串扫描，不依赖模型这次判断得准不准，
+    所以这里故意让模型层返回 consistent=True（模拟模型没识别出问题），验证
+    规则层单独也必须能拦下来。"""
+    fake = FakeLLMClient(responses=[{"results": [{"consistent": True}]}])
+    item = {
+        "action_summary": "曾在字节跳动科技有限公司主导搭建这条数据管道",
+        "result_summary": "提升处理效率 20%",
+    }
+    violations = validate_item_facts(item, "Acme Corp", {"Acme Corp"}, fake)
+    assert violations
+    assert any("字节跳动" in v for v in violations)
+
+
+def test_validate_item_facts_rule_layer_does_not_flag_real_company():
+    fake = FakeLLMClient(responses=[{"results": [{"consistent": True}]}])
+    item = {"action_summary": "在 Acme Corp 期间负责搭建实时数据管道", "result_summary": None}
+    assert validate_item_facts(item, "Acme Corp", {"Acme Corp"}, fake) == []
+
+
+def test_validate_item_facts_model_layer_catches_issue_rule_misses():
+    """规则层只认公司名后缀，抓不住"提到不存在的学历/时间段"这类问题，
+    这条测试专门验证轻量模型层能补上这一块。"""
+    fake = FakeLLMClient(
+        responses=[{"results": [{"consistent": False, "issues": ["提到了博士学位，画像里没有这条学历记录"]}]}]
+    )
+    item = {"action_summary": "作为博士期间的研究项目负责人主导了这项工作", "result_summary": None}
+    assert validate_item_facts(item, "Acme Corp", {"Acme Corp"}, fake) == ["提到了博士学位，画像里没有这条学历记录"]
+
+
+def test_validate_item_facts_passes_when_both_layers_consistent():
+    fake = FakeLLMClient(responses=[{"results": [{"consistent": True}]}])
+    item = {"action_summary": "负责搭建实时数据管道", "result_summary": "提升处理效率 20%"}
+    assert validate_item_facts(item, "Acme Corp", {"Acme Corp"}, fake) == []
+
+
+def test_validate_item_facts_skips_llm_call_for_blank_text():
+    fake = FakeLLMClient(responses=[])
+    assert validate_item_facts({"action_summary": "", "result_summary": None}, "Acme Corp", {"Acme Corp"}, fake) == []
+    assert fake.calls == []
+
+
+def test_batch_validate_facts_defensively_treats_missing_model_result_as_consistent():
+    """模型批量返回的 results 数量少于输入条目数量时（防御性场景，仿照
+    extract_bullet_triads 的补空策略），缺失的那条按"规则层说了算"处理，
+    不额外报错、也不误伤规则层本来就判定通过的条目。"""
+    fake = FakeLLMClient(responses=[{"results": [{"consistent": True}]}])  # 只返回 1 条，但传了 2 个 item
+    items = [
+        {"action_summary": "在 Acme Corp 做了这件事", "result_summary": None},
+        {"action_summary": "又做了另一件真实的事", "result_summary": None},
+    ]
+    result = _batch_validate_facts(items, ["Acme Corp", "Acme Corp"], {"Acme Corp"}, fake)
+    assert result == [[], []]
+
+
+def test_build_resume_draft_guardrail_blocks_fabricated_company_name_after_failed_retry(db_session):
+    """端到端场景：重写步骤的模型输出里混进了一个虚构公司名，轻量模型这次也
+    没识别出来（consistent 模拟成 True），但规则层必须单独拦下；重试一次
+    模型依然编造的话，最终必须回退到真实原文，绝不能把虚构公司名带出
+    build_resume_draft。"""
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Hadoop experience.")
+
+    jd_parse_fake = FakeLLMClient(
+        responses=[
+            {"required_years": None, "required_education": None, "required_clearance": False,
+             "plus_skills": [], "core_responsibilities": [], "key_skills": ["Hadoop"]},
+            {"results": [{"consistent": True}]},  # 命中项批量校验：模型没识别出问题
+            {"results": [{"consistent": True}]},  # 重试后单条复核：模型还是没识别出问题
+        ]
+    )
+    fabricated = {
+        "rewritten": [
+            {
+                "action_summary": "曾在字节跳动科技有限公司主导搭建这条 Hadoop 流水线",
+                "result_summary": "Reduced latency by 18%",
+            }
+        ]
+    }
+    rewrite_fake = FakeLLMClient(responses=[fabricated, fabricated])  # 重试后仍然编造
+
+    draft = build_resume_draft(db_session, jd.id, 0, jd_parse_fake, rewrite_fake)
+
+    assert len(draft.hit_items) == 1
+    assert "字节跳动" not in draft.hit_items[0]["action_summary"]
+    assert draft.hit_items[0]["action_summary"] == "Built ETL pipeline"  # 回退到真实原文
+
+
+def test_build_resume_draft_guardrail_accepts_clean_content_after_successful_retry(db_session):
+    """第一次生成的内容被轻量模型判定不一致，重试后模型给出干净的措辞，
+    这次校验通过——验证"重试成功就采用重试结果"这条路径，而不是一律回退。"""
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Hadoop experience.")
+
+    jd_parse_fake = FakeLLMClient(
+        responses=[
+            {"required_years": None, "required_education": None, "required_clearance": False,
+             "plus_skills": [], "core_responsibilities": [], "key_skills": ["Hadoop"]},
+            {"results": [{"consistent": False, "issues": ["提到了不存在的公司"]}]},  # 第一次：模型发现问题
+            {"results": [{"consistent": True}]},  # 重试后单条复核：干净了
+        ]
+    )
+    fabricated = {"rewritten": [{"action_summary": "曾在字节跳动负责这条流水线", "result_summary": "Reduced latency by 18%"}]}
+    clean = {"rewritten": [{"action_summary": "Led the Hadoop ETL pipeline rollout", "result_summary": "Reduced latency by 18%"}]}
+    rewrite_fake = FakeLLMClient(responses=[fabricated, clean])
+
+    draft = build_resume_draft(db_session, jd.id, 0, jd_parse_fake, rewrite_fake)
+    assert draft.hit_items[0]["action_summary"] == "Led the Hadoop ETL pipeline rollout"
+
+
+def test_build_resume_draft_drops_extension_suggestion_that_fails_guardrail_twice(db_session):
+    """延伸建议这边没有"真实原文"可以回退，两次都没通过校验就必须整条丢弃，
+    不能出现在待确认列表里交给用户。"""
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+
+    jd_parse_fake = FakeLLMClient(
+        responses=[
+            {"required_years": None, "required_education": None, "required_clearance": False,
+             "plus_skills": [], "core_responsibilities": [], "key_skills": ["Spark"]},
+            {"results": [{"consistent": True}]},  # 延伸建议批量校验：规则层单独拦下
+            {"results": [{"consistent": True}]},  # 重试后单条复核：规则层还是拦下
+        ]
+    )
+    fabricated_suggestion = {
+        "suggestions": [
+            {
+                "keyword": "Spark",
+                "plausible": True,
+                "position_index": 1,
+                "action_summary": "在字节跳动科技有限公司使用 Spark 处理批量数据",
+                "result_summary": "consistent ~18% latency gains",
+                "rationale": "同等规模的批处理场景",
+            }
+        ]
+    }
+    heavy_fake = FakeLLMClient(responses=[fabricated_suggestion, fabricated_suggestion])
+
+    draft = build_resume_draft(db_session, jd.id, 10, jd_parse_fake, heavy_fake)
+    assert draft.suggestions == []
+
+
 # ---------- 延伸建议生成：过滤不合理关联 ----------
 
 
@@ -204,8 +352,11 @@ def test_build_resume_draft_k0_produces_no_suggestions(db_session):
     position_id = _seed_experience(db_session)
     jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
     jd_parse_fake = FakeLLMClient(
-        responses=[{"required_years": None, "required_education": None, "required_clearance": False,
-                     "plus_skills": [], "core_responsibilities": [], "key_skills": ["Hadoop", "Spark"]}]
+        responses=[
+            {"required_years": None, "required_education": None, "required_clearance": False,
+             "plus_skills": [], "core_responsibilities": [], "key_skills": ["Hadoop", "Spark"]},
+            {"results": [{"consistent": True}]},  # 事实护栏校验：命中项批量校验的那一次调用
+        ]
     )
     rewrite_fake = FakeLLMClient(responses=[{"rewritten": [{"action_summary": "x", "result_summary": "y"}]}])
     draft = build_resume_draft(db_session, jd.id, 0, jd_parse_fake, rewrite_fake)
@@ -232,7 +383,12 @@ def test_confirm_and_finalize_persists_claimed_skill_and_resume_version(db_sessi
     assert resume_version.id is not None
     assert resume_version.k_value == 5
     assert "Spark" in resume_version.markdown_text
-    assert resume_version.pdf_path is None  # PDF 渲染留待后续增量
+    assert resume_version.pdf_path is not None
+    from pathlib import Path
+
+    pdf_file = Path(resume_version.pdf_path)
+    assert pdf_file.exists()
+    assert pdf_file.read_bytes()[:4] == b"%PDF"
 
     claimed = db_session.query(ClaimedSkill).all()
     assert len(claimed) == 1

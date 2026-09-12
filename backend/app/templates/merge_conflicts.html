@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}确认合并冲突 - JobPilot{% endblock %}
+{% block content %}
+<h1>确认合并冲突</h1>
+<p class="muted">{{ summary }}。下面这些内容和已有画像不完全一致，系统没有自动处理，你逐条选一下怎么办。</p>
+
+<form method="post" action="/dashboard/profile/merge-conflicts/resolve">
+  <input type="hidden" name="conflict_count" value="{{ bullet_conflicts|length + position_field_conflicts|length }}">
+
+  {% set ns = namespace(i=0) %}
+  {% for c in bullet_conflicts %}
+  <div class="card">
+    <h2>贡献句：{{ c.company_name or '' }} · {{ c.position_label }}</h2>
+    <p class="muted">新解析出的一条贡献句和已有的一条相似度很高（{{ '%.0f'|format(c.similarity * 100) }}%），像是同一件事的不同措辞：</p>
+    <p><strong>已有：</strong>{{ c.existing_text }}</p>
+    <p><strong>新的：</strong>{{ c.new_text }}</p>
+    <input type="hidden" name="kind_{{ ns.i }}" value="bullet">
+    <input type="hidden" name="position_id_{{ ns.i }}" value="{{ c.position_id }}">
+    <input type="hidden" name="existing_bullet_id_{{ ns.i }}" value="{{ c.existing_bullet_id }}">
+    <input type="hidden" name="new_text_{{ ns.i }}" value="{{ c.new_text }}">
+    <label><input type="radio" name="choice_{{ ns.i }}" value="keep_old" checked> 保留旧句，丢弃新的</label>
+    <label><input type="radio" name="choice_{{ ns.i }}" value="replace"> 用新句替换旧句</label>
+    <label><input type="radio" name="choice_{{ ns.i }}" value="keep_both"> 两条都保留（当成不同的事）</label>
+    {% set ns.i = ns.i + 1 %}
+  </div>
+  {% endfor %}
+
+  {% for c in position_field_conflicts %}
+  <div class="card">
+    <h2>职位字段：{{ c.company_name or '' }} · {{ c.position_label }}</h2>
+    <p class="muted">
+      {% if c.field == 'start_date' %}入职时间{% elif c.field == 'end_date' %}离职时间{% else %}是否至今在职{% endif %}
+      和已有记录不一致：
+    </p>
+    <p><strong>已有：</strong>{{ c.old_value }}　<strong>新的：</strong>{{ c.new_value }}</p>
+    <input type="hidden" name="kind_{{ ns.i }}" value="position_field">
+    <input type="hidden" name="position_id_{{ ns.i }}" value="{{ c.position_id }}">
+    <input type="hidden" name="field_{{ ns.i }}" value="{{ c.field }}">
+    <input type="hidden" name="new_value_{{ ns.i }}" value="{{ c.new_value }}">
+    <label><input type="radio" name="choice_{{ ns.i }}" value="keep_old" checked> 保留已有的值</label>
+    <label><input type="radio" name="choice_{{ ns.i }}" value="use_new"> 采用新解析出的值</label>
+    {% set ns.i = ns.i + 1 %}
+  </div>
+  {% endfor %}
+
+  <div style="margin-top:16px;"><button type="submit">确认</button></div>
+</form>
+{% endblock %}

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}回答常见问题 - JobPilot{% endblock %}
+{% block content %}
+<p><a href="/dashboard/qa-bank">&larr; 返回题库</a></p>
+<h1>回答常见问题</h1>
+<p class="muted">每个问题都可以留空跳过，答了的会保存进题库，以后投递时直接查阅复用。</p>
+
+<div class="card">
+  <form method="post" action="/dashboard/qa-bank/suggest">
+    <input type="hidden" name="question_count" value="{{ questions|length }}">
+    {% for q in questions %}
+      <label>{{ loop.index }}. {{ q }}</label>
+      <input type="hidden" name="question_{{ loop.index0 }}" value="{{ q }}">
+      <textarea name="answer_{{ loop.index0 }}" placeholder="可以留空跳过这个问题" style="min-height:70px;"></textarea>
+    {% endfor %}
+    <div style="margin-top:16px;"><button type="submit">保存回答</button></div>
+  </form>
+</div>
+{% endblock %}

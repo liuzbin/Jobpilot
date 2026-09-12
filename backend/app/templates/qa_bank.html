@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}问答题库 - JobPilot{% endblock %}
+{% block content %}
+<h1>问答题库</h1>
+<p class="muted">这里存的是投递时反复会遇到的通用问答（自我介绍、优势/劣势、职业规划这一类），
+和某一份具体的 JD 无关，提前想清楚写好，以后投递时直接查阅复用。</p>
+
+<div class="card">
+  <h2>生成常见问题</h2>
+  <p class="muted">根据你的目标职位，系统生成一批常见的投递问答问题，你可以一次性作答。</p>
+  <a href="/dashboard/qa-bank/suggest"><button type="button">生成常见问题</button></a>
+</div>
+
+<div class="card">
+  <h2>手动添加一条</h2>
+  <form method="post" action="/dashboard/qa-bank">
+    <label>问题</label>
+    <input type="text" name="question_text" required>
+    <label>答案</label>
+    <textarea name="answer_text" required style="min-height:70px;"></textarea>
+    <div style="margin-top:12px;"><button type="submit">保存</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>已有的题库（{{ entries|length }} 条）</h2>
+  {% if not entries %}
+    <p class="muted">还没有任何记录，先生成一批常见问题，或者手动添加一条。</p>
+  {% endif %}
+  {% for entry in entries %}
+    <div class="qa-item">
+      <div class="qa-question">{{ entry.question_text }}</div>
+      <div class="qa-answer">{{ entry.answer_text }}</div>
+      <div class="muted" style="font-size:12px;">
+        来源：{{ '建画像阶段' if entry.source.value == 'onboarding' else '某次投递中补充' }}
+        · 使用 {{ entry.use_count }} 次
+        <form method="post" action="/dashboard/qa-bank/{{ entry.id }}/delete" style="display:inline;">
+          <button type="submit" class="secondary" style="font-size:12px; padding:2px 8px;">删除</button>
+        </form>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}

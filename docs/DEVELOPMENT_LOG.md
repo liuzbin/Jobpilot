@@ -170,3 +170,79 @@
 `docs/JobPilot_实施方案.md`（v2，新增"核心价值主张"章节 + Phase 2 详细设计）、`backend/app/models/tables.py`、`backend/alembic/versions/3eea4bce52ea_phase2_profile_depth_and_claimed_skill.py`、`backend/app/services/profile_deepening.py`（新增）、`backend/app/services/resume_tailor.py`（新增）、`backend/app/api/routes_dashboard.py`、`backend/app/templates/position_detail.html`（新增）、`backend/app/templates/position_interview.html`（新增）、`backend/app/templates/resume_tailor.html`（新增）、`backend/app/templates/resume_result.html`（新增）、`backend/app/templates/base.html`、`backend/app/templates/profile.html`、`backend/app/templates/job_detail.html`、`backend/tests/test_profile_deepening.py`（新增）、`backend/tests/test_resume_tailor.py`（新增）、`backend/tests/test_dashboard.py`
 
 ---
+
+## Phase 2 补完：事实字段护栏校验、PDF 渲染、qa_bank 问答收集、工作经历树增删改（2026-09-11 ~ 2026-09-12）
+
+### 目标
+
+进入 Phase 3 之前，按用户"每完成一个 Phase 就停下来汇报"的要求做了一次收尾自查：对照《JobPilot 实施方案》第八节 Phase 2 清单逐项核对代码，发现虽然访谈式画像深化、bullet 三元组抽取、K 值驱动的简历重制主链路都已经落地并通过了测试，但清单里另外 4 项实际上没有真正做完——之前把"核心链路跑通"当成了"Phase 2 完成"来汇报，是不准确的：
+
+1. 事实字段护栏校验完全缺失——这是 v1 就定好、文档里写明"Phase 2 不做改动"的硬约束，但代码里根本没有这一步。
+2. PDF 渲染（WeasyPrint）在代码里被显式跳过，只有 Markdown/JSON 两个产物。
+3. `qa_bank` 表从 Phase 0 就建好了，但没有任何写入/收集流程。
+4. 工作经历树的增删改交互仍然是 Phase 1 的自动合并简化版，没有升级成文档里说的交互式合并/替换。
+
+把这 4 项发现和处理方案交给用户选择后，用户明确要求"先补完全部 4 项，再进 Phase 3"，所以本次收尾按这个顺序做：事实字段护栏校验 → PDF 渲染 → qa_bank 收集流程 → 工作经历树增删改 + 合并冲突确认，每做完一项跑一遍全量测试确认零回归，全部完成后统一收尾汇报。
+
+### 实现内容
+
+- **事实字段护栏校验**（`backend/app/services/resume_tailor.py`）：两层校验，规则层用正则 `_COMPANY_SUFFIX_PATTERN` 扫描生成文本里形如"XX科技/集团/有限公司/Inc./LLC"的公司名模式，命中but不在已知公司名单里的判定为违规；模型层把一批命中项/延伸建议的文本批量丢给轻量模型做语义一致性判断（复用 `extract_bullet_triads` 已经验证过的"一次请求批量处理多条"模式，避免每条都单独调用）。两种违规来源合并后按统一策略处理：命中项（`hit_items`，对应用户真实经历改写出来的内容）校验失败会先重试一次改写，仍失败则直接回退成真实原文——因为真实原文本身必然能通过校验，这是"最坏情况下也不会比不做校验更差"的兜底；延伸建议（`suggestions`，凭 JD 关键词推出来的技能延伸）校验失败会重试一次生成，仍失败则整条丢弃、不展示给用户，因为延伸建议没有"真实原文"可以兜底。新增 9 条测试，包括自测方案里明确要求的"故意在生成结果里注入一个不存在的公司名，断言护栏校验能拦截"这条场景，覆盖回退成功、回退失败降级为原文、延伸建议两次失败后被丢弃三条路径。
+- **PDF 渲染**（`backend/app/services/resume_pdf.py` + `backend/app/templates/resume_styles/default.html`，新增）：用 Jinja2 把结构化简历 JSON 渲染成独立的 HTML（不继承 Dashboard 的 `base.html`，是完全独立的一套排版），再用 WeasyPrint 转成 PDF 落盘到 `~/.jobpilot/resumes/resume_{version_id}.pdf`，`confirm_and_finalize()` 在写入 `resume_version` 记录后顺带生成 PDF、把路径存回 `pdf_path` 字段；PDF 是附加产物，渲染失败会被捕获并记日志，不会拖垮整个确认流程（简历的 Markdown/JSON 主产物不受影响）。`style_id` 和模板文件一一对应，为后续 Phase 5 加更多风格模板留了口子。Dashboard 简历结果页新增 PDF 下载链接，新增下载路由。测试用 `HTML(string=...).render().pages` 直接拿 WeasyPrint 自己的分页结果做断言（不依赖额外的 PDF 解析库），验证短简历是 1 页、故意撑长的简历能正确分页成 3 页而不是内容重叠或被截断。
+- **qa_bank 问答收集流程**（`backend/app/services/qa_bank_service.py`，新增）：支持两种录入方式——手动直接填问题+答案；或者基于画像内容（目标职位、工作经历摘要）让轻量模型建议一批常见面试/申请问题，用户逐条选择要不要现在就填答案、跳过的不写入。写入时按问题文本归一化后去重（同一个问题多次回答按最新的覆盖，不是重复插入）。Dashboard 新增题库列表页（增删）和"生成常见问题建议"页。
+- **工作经历树增删改 + 合并冲突确认**（`backend/app/services/profile_service.py`）：新增公司/职位/贡献句的手动增删改接口（`add_company`/`delete_company`/`add_position`/`update_position_fields`/`delete_position`/`add_bullet`/`update_bullet_content`/`delete_bullet`），级联删除依赖 `ExperienceEntry` 已有的 `cascade="all, delete-orphan"` 关系，删公司连带删掉底下所有职位和贡献句。编辑贡献句原文时会把已抽取的三元组字段清空，交给下次上传/深化时的 `backfill_bullet_triads` 惰性重新抽取，不做同步的 LLM 调用。合并冲突检测：新贡献句和同一职位下已有贡献句用 `difflib.SequenceMatcher` 算文本相似度，≥0.82 判定为"像是同一件事的不同措辞"，不再自动写入，而是收集成 `bullet_conflicts` 列表；职位的起止时间、是否在职字段如果新旧值都非空且不一致，收集成 `position_field_conflicts`；两种情况都遵循"空白字段自动填补不算冲突，只有双方都有值且不一致才算冲突"的原则（沿用 Phase 1 定下的 `fill_blank_profile_basic_fields` 设计哲学）。上传简历时如果产生了冲突，路由不再直接跳转回画像页，而是渲染一个"确认合并冲突"页面，用隐藏字段把每条冲突需要的上下文（职位 ID、已有贡献句 ID、新旧文本/字段值）编好下标传下去，用户逐条选完提交到统一的 resolve 接口应用。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **护栏校验的重试策略是"重试一次就降级/丢弃"，不是无限重试**：无限重试在模型持续给出不一致结果时会让用户等待时间不可控，"重试一次仍失败就用有把握的兜底方案"在体验和正确性之间是更稳的选择，尤其是命中项永远有真实原文可以兜底，风险很低。
+2. **PDF 渲染失败不影响主流程，只记日志**：PDF 是简历的第三种呈现形式（Markdown/JSON 是主产物，Dashboard 上直接能看到），本地环境的字体、依赖库版本可能有差异导致渲染偶发失败，不应该让这种边缘情况挡住用户拿到 Markdown/JSON 结果。
+3. **qa_bank 的问题去重按归一化文本，不做语义级别的相似问题合并**：语义相似度合并需要 embedding，而 embedding 检索是文档里明确写给 Phase 4（自动化填表）用的能力，这里先用最简单的文本归一化去重把"重复点两次生成建议"这种最常见的重复场景挡住，语义级别的合并留给 Phase 4 一起做。
+4. **贡献句相似度阈值 0.82 是经验值，不是从数据集调出来的**：选择的依据是"要能挡住换了几个词但说的是同一件事的重复表达，同时不能把两件真正不同的事误判成冲突"，目前用有限的几个测试用例验证了这个直觉成立，后续如果真实使用中发现阈值偏松或偏紧，是一个容易独立调整的参数，不涉及架构改动。
+
+### 遇到的问题与解决
+
+**问题一：`_batch_validate_facts` 从"每条单独校验"改成"批量校验"时，丢了原有的空文本提前返回逻辑**
+
+现象：`test_validate_item_facts_skips_llm_call_for_blank_text` 测试失败——批量重构之后，即使一批文本全是空的，代码还是会尝试调用一次轻量模型。
+
+原因：单条校验版本里"文本为空就不调用模型直接返回空结果"这条判断，在改造成批量接口时被漏掉了，批量版本原来的逻辑是"只要 texts 列表非空就调用"，没有考虑到列表非空但每一项内容都是空字符串的情况。
+
+解决：在批量函数里补回这条判断，用 `if not any(texts): return rule_violations` 在真正发起模型调用之前拦一道，任何一条文本非空才会真的调用模型。
+
+**问题二：给 `build_resume_draft` 加上护栏校验之后，两处已有测试的 `FakeLLMClient` 响应队列对不上号了**
+
+现象：`test_build_resume_draft_k0_produces_no_suggestions`（`test_resume_tailor.py`）和 `test_tailor_draft_and_confirm_full_flow`（`test_dashboard.py`）都开始失败，报的是"响应队列已耗尽"或者拿到了形状不对的 JSON。
+
+原因：`build_resume_draft` 内部新增了一次护栏校验调用，`FakeLLMClient` 是按调用顺序严格弹出预设响应的，新增的这次调用会插到原来两条测试准备好的响应序列中间，把后面的调用全部错位。
+
+解决：给这两条测试各自的 `light_client` 响应队列里补一条 `{"results": [{"consistent": True}]}`，位置对应护栏校验实际发生的那次调用，并在代码里加注释说明为什么多了这一条，避免以后有人看不懂又删掉。这也是继续验证了此前 Phase 2 主体开发时踩过的同一类坑——`FakeLLMClient` 测试的响应队列必须和实际调用顺序完全对齐，新增任何一次调用都要回头检查所有复用这套响应队列的测试。
+
+**问题三：Jinja2 模板里 `position.items` 被解析成了 dict 的内置 `.items()` 方法**
+
+现象：PDF 模板渲染时报 `TypeError: 'builtin_function_or_method' object is not iterable`。
+
+原因：传给模板的 `position` 是一个普通 dict，其中有一个键就叫 `items`（存这段职位下的贡献句列表）；Jinja2 的属性访问语法 `position.items` 在 dict 上会优先解析成 Python dict 自带的 `.items()` 方法，而不是去找字典里名为 `items` 的键，这是 Jinja2 属性访问对 dict 的一个通用行为（不限于这个字段名，任何撞上 dict 方法名的键都会有同样的问题）。
+
+解决：改用下标访问 `position['items']`，绕开 Jinja2 的属性优先解析规则。记录下来提醒以后设计传给模板的数据结构时，尽量避免用 `items`/`keys`/`values` 这类和 dict 内置方法同名的键。
+
+**问题四：`qa_bank` 按创建时间排序在同一秒内创建的多条记录时顺序不稳定**
+
+现象：`test_list_qa_entries_orders_newest_first` 间歇性失败——本地测试环境跑得快，两条记录经常落在同一秒内创建。
+
+原因：SQLite 的 `CURRENT_TIMESTAMP`/`func.now()` 精度只到秒级，同一秒内插入的多条记录 `created_at` 值完全相同，按这个字段排序时数据库不保证稳定顺序。
+
+解决：改成按自增主键 `id.desc()` 排序——插入顺序和 `id` 递增顺序天然一致，比依赖时间戳精度可靠。这个坑记下来，以后任何"按插入顺序展示"的需求都优先考虑用自增 ID 排序而不是时间戳排序。
+
+**观察到但暂不处理：全量测试跑起来比 Phase 2 之前明显变慢**
+
+给 `confirm_and_finalize` 加上 WeasyPrint PDF 生成之后，全量测试从原来的几十秒涨到了 70-80 秒左右（很多测试路径会间接触发一次简历确认，也就间接触发一次 PDF 渲染），原因是字体加载和排版计算这类工作本身有固定开销，不是哪里写得低效。因为 PDF 渲染在真实使用场景里是用户点一次"确认"按钮才触发一次的低频操作，不是任何请求路径上的热点，所以这里选择先记录下这个性能特征、不做优化，如果后续 Phase 测试套件跑起来的耗时变成明显的开发体验问题，再回头考虑给测试单独配置跳过真实 PDF 渲染的选项。
+
+### 验证结果
+
+- 新增/扩展 4 个 pytest 文件：`test_resume_tailor.py` 新增 9 条护栏校验用例，新增 `test_resume_pdf.py`（6 条，含分页稳定性验证）、`test_qa_bank_service.py`（新增，10 条）、`test_profile_service.py` 新增约 25 条（冲突检测、冲突确认、CRUD 全覆盖），`test_dashboard.py` 新增 5 条端到端用例（合并冲突确认全流程、CRUD 路由全流程），加上 Phase 0/1/2 主体遗留的用例，`backend` 目录下共 **152 条 pytest 用例全部通过**，零回归。
+- 先在云端沙盒环境跑通全部 152 条用例，再把新增/修改的 19 个文件同步到用户本机项目目录（`C:\liuzhibin\aI-agent\jobpilot`），逐文件核对 SHA-256 校验和确认全部 54 个相关文件（含未改动的）同步后完全一致，在设备侧独立 Linux 虚拟环境（`~/jobpilot_venv`，沿用 Phase 1/2 建立的隔离测试环境）里装上新增的 `weasyprint==70.0` 依赖、重新跑一遍全部 152 条用例，结果一致。
+
+### 涉及文件
+
+`docs/JobPilot_实施方案.md`（v3，第八节 Phase 2 清单全部标记完成 + 第六节合并交互决策记录更新）、`backend/requirements.txt`（新增 `weasyprint==70.0`）、`backend/app/services/resume_tailor.py`、`backend/app/services/resume_pdf.py`（新增）、`backend/app/services/qa_bank_service.py`（新增）、`backend/app/services/profile_service.py`、`backend/app/api/routes_dashboard.py`、`backend/app/templates/resume_styles/default.html`（新增）、`backend/app/templates/qa_bank.html`（新增）、`backend/app/templates/qa_bank_suggest.html`（新增）、`backend/app/templates/merge_conflicts.html`（新增）、`backend/app/templates/base.html`、`backend/app/templates/profile.html`、`backend/app/templates/position_detail.html`、`backend/app/templates/resume_result.html`、`backend/tests/test_resume_tailor.py`、`backend/tests/test_resume_pdf.py`（新增）、`backend/tests/test_qa_bank_service.py`（新增）、`backend/tests/test_profile_service.py`、`backend/tests/test_dashboard.py`
+
+---

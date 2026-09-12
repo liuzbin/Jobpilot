@@ -44,13 +44,24 @@
 </div>
 
 <div class="card">
+  <h2>新增公司</h2>
+  <form method="post" action="/dashboard/profile/companies">
+    <input type="text" name="company_name" placeholder="公司名称" required>
+    <button type="submit">新增</button>
+  </form>
+</div>
+
+<div class="card">
   <h2>工作经历（{{ experience|length }} 家公司）</h2>
   {% if not experience %}
-    <p class="muted">还没有工作经历数据，上传简历试试。</p>
+    <p class="muted">还没有工作经历数据，上传简历试试，或者上面手动新增一家公司。</p>
   {% endif %}
   {% for company in experience %}
     <div class="company-block">
       <strong>{{ company.company_name }}</strong>
+      <form method="post" action="/dashboard/profile/companies/{{ company.id }}/delete" style="display:inline;">
+        <button type="submit" class="secondary" style="font-size:12px; padding:2px 8px;">删除整家公司</button>
+      </form>
       {% for pos in company.positions %}
         <div class="position-block">
           <div><a href="/dashboard/profile/positions/{{ pos.id }}">{{ pos.position_title or '' }}{% if pos.project_name and pos.project_name != pos.position_title %} · {{ pos.project_name }}{% endif %}</a>
@@ -59,11 +70,25 @@
           {% for b in pos.bullets %}
             <div class="bullet">- {{ b.content }}</div>
           {% endfor %}
-          <div class="muted" style="font-size:12px; margin-top:4px;"><a href="/dashboard/profile/positions/{{ pos.id }}">查看项目背景 / 深化这段经历 &rarr;</a></div>
+          <div class="muted" style="font-size:12px; margin-top:4px;"><a href="/dashboard/profile/positions/{{ pos.id }}">查看项目背景 / 编辑贡献句 / 深化这段经历 &rarr;</a></div>
         </div>
       {% endfor %}
+      <details style="margin-top:8px;">
+        <summary class="muted" style="cursor:pointer; font-size:13px;">在这家公司下新增职位</summary>
+        <form method="post" action="/dashboard/profile/companies/{{ company.id }}/positions" style="margin-top:8px;">
+          <label>职位名称</label>
+          <input type="text" name="position_title">
+          <label>项目名称</label>
+          <input type="text" name="project_name">
+          <label>起始时间</label>
+          <input type="text" name="start_date" placeholder="2022-01">
+          <label>结束时间</label>
+          <input type="text" name="end_date" placeholder="留空表示至今">
+          <label><input type="checkbox" name="is_current" value="1"> 目前在职</label>
+          <div style="margin-top:8px;"><button type="submit">新增职位</button></div>
+        </form>
+      </details>
     </div>
   {% endfor %}
-  <p class="muted">逐条编辑/删除工作经历的界面留到后续做，目前只能通过重新上传简历来增量补充，或者点进某段经历去"深化"背景描述。</p>
 </div>
 {% endblock %}

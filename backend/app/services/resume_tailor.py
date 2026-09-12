@@ -15,13 +15,21 @@ Phase 2：简历重制——见实施方案 4/5.3。核心是把 K 值语义落�
 打分引擎（scoring.compute_score）完全不读这个模块产出的任何东西——这是刻意
 的边界，见实施方案第一节"核心价值主张"。
 
-本模块目前只产出结构化 JSON + 纯文本 Markdown 预览，PDF 渲染
-（Jinja2 + WeasyPrint、简历风格模板）是这个阶段的后续增量，暂未实现。
+无论是重组真实内容还是构造延伸建议，生成出来的自由文本都会先过一道事实字段
+护栏校验（规则扫描疑似公司名 + 轻量模型语义比对），不通过就重试一次，仍不
+通过就回退到真实原文（命中项）或整条丢弃（延伸建议），绝不把编造内容交给
+用户确认——这一段是 v1 就定好、任何 K 值下都不放松的设计，见实施方案 5.3。
+
+`confirm_and_finalize` 产出结构化 JSON + Markdown 预览之后，还会调用
+`app.services.resume_pdf` 按 `style_id` 渲染一份 PDF 落盘（见 5.3 的"生成
+管线"）；PDF 渲染失败不影响 JSON/Markdown 的可用性，只是当次没有 PDF 下载。
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
@@ -37,10 +45,181 @@ from app.models.tables import (
 )
 from app.services.jd_ingest import structure_jd_text
 from app.services.profile_service import get_or_create_profile_basic
+from app.services.resume_pdf import save_resume_pdf
+
+logger = logging.getLogger("jobpilot")
 
 
 class JDNotFoundError(RuntimeError):
     pass
+
+
+# ---------- 事实字段护栏校验（见实施方案 5.3：v1 就定好、任何 K 值下都不放松） ----------
+#
+# 结构上，公司名/职位名/项目名这些"事实性硬字段"从来不经过 LLM——它们始终是
+# build_resume_draft/confirm_and_finalize 直接从数据库读出来拼进 resume_json 的,
+# LLM 只被允许改写 action_summary/result_summary 这两段自由文本。但自由文本本身
+# 仍然可能"顺嘴"编出一个不属于当前经历的公司名（比如把别的项目背景串进来,或者
+# 干脆凭空提一个不存在的公司）,所以这里单独加一道自动校验：规则层先做一次
+# 确定性的公司名扫描,轻量模型再做一次语义层面的事实一致性比对。任何一层校验
+# 不通过就判定这条内容不可信,调用方负责重试或回退,绝不会把校验不通过的内容
+# 直接交给用户。
+
+_COMPANY_SUFFIX_PATTERN = re.compile(
+    r"[一-龥A-Za-z0-9&()（）\.\-]{2,24}"
+    r"(?:科技|集团|网络|信息技术|软件|工作室|"
+    r"有限责任公司|股份有限公司|有限公司|公司|"
+    r"Inc\.?|LLC|LLP|Corp\.?|Corporation|Ltd\.?|Co\.,?\s*Ltd\.?)"
+)
+
+
+def _known_companies(positions: list[ExperienceEntry]) -> set[str]:
+    return {p.parent.company_name for p in positions if p.parent and p.parent.company_name}
+
+
+def _rule_scan_foreign_companies(text: str, known_companies: set[str]) -> list[str]:
+    """规则层：扫描文本里长得像公司名（常见公司后缀）的片段，任何一个都不是
+    画像里真实存在的公司名时，判定为疑似编造。纯字符串规则，不依赖 LLM，
+    结果确定性可复现，方便直接写单元测试锁定。"""
+    violations = []
+    for match in _COMPANY_SUFFIX_PATTERN.finditer(text or ""):
+        candidate = match.group(0).strip()
+        if not candidate:
+            continue
+        if any(candidate in company or company in candidate for company in known_companies if company):
+            continue
+        violations.append(f'文本中出现疑似公司名"{candidate}"，不在画像的真实公司列表中')
+    return violations
+
+
+FACT_GUARDRAIL_SYSTEM_PROMPT = """\
+你负责批量校验若干段简历内容是否编造了和候选人真实背景不一致的具体公司、
+职位、任职时间段或学历/学位信息。你会收到一组条目，每条包含它"应该"归属的
+真实背景（候选人在哪家公司的一段经历），以及生成出来的文本。
+
+对每一条：只有当文本明确提到了一个和真实背景不一致的具体公司名、职位名、
+时间段或学历时才判定为不一致；纯粹的技术细节、措辞调整、没有点名任何具体
+机构/时间/学历的表述都不算不一致。
+
+严格按下面的 JSON 结构输出，`results` 数组长度和顺序必须和输入条目一一对应：
+{"results": [{"consistent": true 或 false, "issues": ["..."]}]}
+"""
+
+
+def _batch_validate_facts(
+    items: list[dict],
+    true_companies: list[str | None],
+    known_companies: set[str],
+    light_client: LLMClient,
+) -> list[list[str]]:
+    """批量校验一组条目，返回每条对应的违规原因列表（空列表代表通过）。规则层
+    对每条都单独跑（纯字符串扫描，零成本），轻量模型层为了控制调用次数、
+    也为了和代码库里其它批量抽取（比如 extract_bullet_triads）保持同样的
+    "一批一次调用"的约定，只发一次请求覆盖整批。"""
+    if not items:
+        return []
+
+    texts = [f"{it.get('action_summary') or ''} {it.get('result_summary') or ''}".strip() for it in items]
+    rule_violations = [_rule_scan_foreign_companies(t, known_companies) for t in texts]
+
+    if not any(texts):
+        # 整批都是空文本，没什么可校验的，不必浪费一次模型调用。
+        return rule_violations
+
+    entries_text = "\n".join(
+        f"{i + 1}. 真实背景：候选人在「{company or '未知公司'}」的一段经历\n   生成文本：{text}"
+        for i, (text, company) in enumerate(zip(texts, true_companies))
+    )
+    result = light_client.complete_json(FACT_GUARDRAIL_SYSTEM_PROMPT, entries_text)
+    raw_results = result.get("results") or []
+
+    combined: list[list[str]] = []
+    for i in range(len(items)):
+        violations = list(rule_violations[i])
+        model_result = raw_results[i] if i < len(raw_results) and isinstance(raw_results[i], dict) else {}
+        if not model_result.get("consistent", True):
+            for issue in model_result.get("issues") or []:
+                if issue and issue not in violations:
+                    violations.append(issue)
+        combined.append(violations)
+    return combined
+
+
+def validate_item_facts(
+    item: dict,
+    true_company: str | None,
+    known_companies: set[str],
+    light_client: LLMClient,
+) -> list[str]:
+    """单条校验，内部就是批量校验函数的单元素特例，主要给重试路径用（重试
+    只需要重新校验刚重新生成的这一条，没必要凑一整批）。"""
+    return _batch_validate_facts([item], [true_company], known_companies, light_client)[0]
+
+
+def _validate_and_repair_hit_items(
+    original_hits: list[dict],
+    rewritten_items: list[dict],
+    jd: JDRecord,
+    known_companies: set[str],
+    light_client: LLMClient,
+    heavy_client: LLMClient,
+) -> list[dict]:
+    """对重写后的命中项批量跑护栏校验：不通过的逐条重试一次，还不通过就回退
+    到未经改写的真实原文——原文本来就是从数据库里如实取出来的，必然通过
+    校验，保证无论如何都不会把编造内容交给用户。"""
+    true_companies = [item.get("company_name") for item in rewritten_items]
+    all_violations = _batch_validate_facts(rewritten_items, true_companies, known_companies, light_client)
+
+    repaired: list[dict] = []
+    for original, item, violations in zip(original_hits, rewritten_items, all_violations):
+        if not violations:
+            repaired.append(item)
+            continue
+
+        retried_list = rewrite_hit_bullets([original], jd, heavy_client)
+        retried = retried_list[0] if retried_list else dict(original)
+        violations2 = validate_item_facts(retried, retried.get("company_name"), known_companies, light_client)
+        repaired.append(retried if not violations2 else dict(original))
+    return repaired
+
+
+def _validate_and_filter_suggestions(
+    suggestions: list[dict],
+    positions: list[ExperienceEntry],
+    known_companies: set[str],
+    light_client: LLMClient,
+    heavy_client: LLMClient,
+) -> list[dict]:
+    """对延伸建议批量跑护栏校验：不通过的针对该关键词重新生成一次，还不通过
+    就整条丢弃——延伸建议本身就是构造出来的内容，没有"真实原文"可以回退，
+    校验不过就不应该出现在待确认列表里。"""
+    position_by_id = {p.id: p for p in positions}
+
+    def _true_company(suggestion: dict) -> str | None:
+        position = position_by_id.get(suggestion.get("experience_entry_id"))
+        return position.parent.company_name if position and position.parent else None
+
+    true_companies = [_true_company(s) for s in suggestions]
+    all_violations = _batch_validate_facts(suggestions, true_companies, known_companies, light_client)
+
+    valid: list[dict] = []
+    for suggestion, violations in zip(suggestions, all_violations):
+        if not violations:
+            valid.append(suggestion)
+            continue
+
+        retried = generate_extension_suggestions(positions, [suggestion["keyword"]], heavy_client)
+        retried_match = next(
+            (s for s in retried if _norm_keyword(s.get("keyword")) == _norm_keyword(suggestion.get("keyword"))),
+            None,
+        )
+        if retried_match is None:
+            continue
+        violations2 = validate_item_facts(retried_match, _true_company(retried_match), known_companies, light_client)
+        if not violations2:
+            valid.append(retried_match)
+        # 仍不通过：整条丢弃，不进入待确认列表
+    return valid
 
 
 # ---------- 关键词命中判定（纯函数，不涉及 LLM） ----------
@@ -286,9 +465,15 @@ def build_resume_draft(
         jd.parsed_meta = merged_meta
         db.commit()
 
+    known_companies = _known_companies(positions)
+
     jd_keywords = collect_jd_keywords(jd_parsed)
     hits = find_hit_bullets(jd_keywords, positions)
     hit_items = rewrite_hit_bullets(hits, jd, heavy_client) if hits else []
+    if hit_items:
+        hit_items = _validate_and_repair_hit_items(
+            hits, hit_items, jd, known_companies, light_client, heavy_client
+        )
 
     missing = find_missing_keywords(jd_keywords, positions)
     keywords_to_extend = select_keywords_to_extend(missing, k_value)
@@ -297,6 +482,10 @@ def build_resume_draft(
         if keywords_to_extend
         else []
     )
+    if suggestions:
+        suggestions = _validate_and_filter_suggestions(
+            suggestions, positions, known_companies, light_client, heavy_client
+        )
 
     return ResumeDraft(k_value=k_value, hit_items=hit_items, suggestions=suggestions)
 
@@ -415,9 +604,23 @@ def confirm_and_finalize(
         style_id=style_id,
         resume_json=resume_json,
         markdown_text=markdown_text,
-        pdf_path=None,  # PDF 渲染（Jinja2 + WeasyPrint 风格模板）留待后续增量实现
+        pdf_path=None,
     )
     db.add(resume_version)
     db.commit()
     db.refresh(resume_version)
+
+    # PDF 渲染需要先拿到 resume_version.id 才能确定文件名，所以放在第一次
+    # commit 之后单独做一次；渲染失败不应该让整个"确认简历"操作报错回滚——
+    # Markdown/JSON 才是事实来源，PDF 只是它的一种展示形式，缺了它用户仍然
+    # 能拿到完整可用的简历内容,只是没有 PDF 下载链接。
+    try:
+        pdf_path = save_resume_pdf(resume_version.id, resume_json, style_id)
+        resume_version.pdf_path = str(pdf_path)
+        db.commit()
+        db.refresh(resume_version)
+    except Exception:  # noqa: BLE001 - PDF 是附加产物，失败不应该拖垮整个确认流程
+        db.rollback()
+        logger.exception("简历 PDF 渲染失败（resume_version_id=%s），已跳过，Markdown/JSON 不受影响", resume_version.id)
+
     return resume_version
