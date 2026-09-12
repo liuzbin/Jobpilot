@@ -10,7 +10,7 @@
   {% if resume_version.pdf_path %}
   <p><a href="/dashboard/jobs/{{ jd.id }}/resumes/{{ resume_version.id }}/pdf">下载 PDF（{{ resume_version.style_id }} 风格）</a></p>
   {% else %}
-  <p class="muted">PDF 这次没有生成成功（不影响下面的内容），可以重新生成一次简历再试。</p>
+  <p class="muted">PDF 这次没有生成成功（不影响下面的内容）。常见原因是本地环境缺少 PDF 渲染依赖（WeasyPrint 需要系统级的 Pango/GObject 库，Windows 上需要单独安装 GTK3 运行时），装好依赖、重启本地 App 后重新生成一次即可；具体的错误原因会记录在本地 App 的启动日志里。</p>
   {% endif %}
   <pre style="white-space:pre-wrap; font-family:inherit; font-size:13px;">{{ resume_version.markdown_text }}</pre>
 </div>

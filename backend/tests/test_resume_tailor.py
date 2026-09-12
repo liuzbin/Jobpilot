@@ -423,6 +423,27 @@ def test_confirm_and_finalize_missing_jd_raises(db_session):
         confirm_and_finalize(db_session, 9999, 5, [], [])
 
 
+def test_confirm_and_finalize_degrades_gracefully_when_pdf_rendering_unavailable(db_session, monkeypatch):
+    """回归测试：WeasyPrint 没装好系统依赖时（Windows 上常见的
+    'libgobject-2.0-0' 加载失败），`confirm_and_finalize` 不应该跟着报错——
+    resume_json/markdown_text 才是事实来源，PDF 只是附加产物，缺了它应该
+    只是 `pdf_path` 为空，简历确认这个操作本身必须成功。"""
+    from app.services import resume_pdf
+
+    monkeypatch.setattr(resume_pdf, "_WeasyPrintHTML", None)
+    monkeypatch.setattr(resume_pdf, "_WEASYPRINT_IMPORT_ERROR", ImportError("simulated missing libgobject"))
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [])
+
+    assert resume_version.id is not None
+    assert resume_version.markdown_text  # 事实来源不受影响
+    assert resume_version.pdf_path is None
+
+
 # ---------- 回归测试：认领技能库不影响打分引擎 ----------
 
 

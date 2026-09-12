@@ -8,10 +8,15 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
+
 import pytest
 from weasyprint import HTML
 
+from app.services import resume_pdf
 from app.services.resume_pdf import (
+    PdfRenderingUnavailableError,
     UnknownResumeStyleError,
     render_resume_html,
     render_resume_pdf_bytes,
@@ -90,6 +95,60 @@ def test_save_resume_pdf_writes_file_to_disk(isolated_home):
     assert path.exists()
     assert path == get_settings().home / "resumes" / "resume_42.pdf"
     assert path.read_bytes()[:4] == b"%PDF"
+
+
+def test_render_resume_pdf_bytes_raises_friendly_error_when_weasyprint_unavailable(monkeypatch):
+    """回归测试：本地环境缺系统级 Pango/GObject 库（Windows 上最常见，
+    `pip install weasyprint` 装不上这些）时，之前的版本会在模块 import
+    阶段直接崩掉、拖垮整个 App 启动；现在改成运行时才检查，这里验证检查
+    到位——不能用就抛信息明确的 `PdfRenderingUnavailableError`，而不是让
+    调用方直接看到一个原始的 cffi/OSError。"""
+    monkeypatch.setattr(resume_pdf, "_WeasyPrintHTML", None)
+    monkeypatch.setattr(resume_pdf, "_WEASYPRINT_IMPORT_ERROR", ImportError("simulated missing libgobject-2.0-0"))
+
+    with pytest.raises(PdfRenderingUnavailableError) as exc_info:
+        render_resume_pdf_bytes(_short_resume())
+
+    assert "GTK3" in str(exc_info.value) or "Pango" in str(exc_info.value)
+
+
+def test_module_import_survives_real_weasyprint_import_failure():
+    """最贴近真实故障场景的回归测试：不是"调用某个函数时环境缺依赖"，而是
+    "这个模块被 import 的那一刻，`import weasyprint` 本身就抛异常"——这正是
+    Windows 上真实发生过的情况（缺 libgobject-2.0-0，`from weasyprint import
+    HTML` 直接在模块顶层崩掉，进而拖垮 `resume_tailor.py` ->
+    `routes_dashboard.py` -> `app.main` 整条 import 链）。用
+    `sys.modules['weasyprint'] = None` 这个 Python 标准技巧强制让接下来的
+    `import weasyprint` 抛 ImportError，重新加载 `resume_pdf` 模块，断言
+    重新加载本身不抛异常、且模块记录下了"这次不可用"这个状态。"""
+    original_weasyprint = sys.modules.get("weasyprint")
+    sys.modules["weasyprint"] = None  # None 是文档化的写法：强制下一次 import 失败
+    try:
+        reloaded = importlib.reload(resume_pdf)
+        assert reloaded._WeasyPrintHTML is None
+        assert reloaded._WEASYPRINT_IMPORT_ERROR is not None
+        # 用重新加载之后模块自己的异常类，而不是文件顶部 reload 之前导入的
+        # 那个引用——`importlib.reload` 会重新执行类定义,产生一个新的类
+        # 对象,和 reload 之前 import 进来的旧类对象不是同一个身份,
+        # `pytest.raises(旧引用)` 抓不住新对象抛出的实例。
+        with pytest.raises(reloaded.PdfRenderingUnavailableError):
+            reloaded.render_resume_pdf_bytes(_short_resume())
+    finally:
+        # 恢复真实的 weasyprint，避免这次 reload 的副作用影响同一个测试
+        # 进程里其他测试用例（PDF 分页测试等都依赖真实的 WeasyPrint 可用）。
+        if original_weasyprint is not None:
+            sys.modules["weasyprint"] = original_weasyprint
+        else:
+            sys.modules.pop("weasyprint", None)
+        importlib.reload(resume_pdf)
+
+
+def test_render_resume_html_unaffected_when_weasyprint_unavailable(monkeypatch):
+    # render_resume_html 只依赖 Jinja2，不应该受 WeasyPrint 是否可用影响——
+    # Markdown/结构化数据这条链路完全独立于 PDF 渲染。
+    monkeypatch.setattr(resume_pdf, "_WeasyPrintHTML", None)
+    html = render_resume_html(_short_resume())
+    assert "李明" in html
 
 
 def test_pdf_layout_paginates_instead_of_crashing_or_truncating():
