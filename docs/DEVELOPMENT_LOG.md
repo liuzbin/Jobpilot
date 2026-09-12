@@ -246,3 +246,56 @@
 `docs/JobPilot_实施方案.md`（v3，第八节 Phase 2 清单全部标记完成 + 第六节合并交互决策记录更新）、`backend/requirements.txt`（新增 `weasyprint==70.0`）、`backend/app/services/resume_tailor.py`、`backend/app/services/resume_pdf.py`（新增）、`backend/app/services/qa_bank_service.py`（新增）、`backend/app/services/profile_service.py`、`backend/app/api/routes_dashboard.py`、`backend/app/templates/resume_styles/default.html`（新增）、`backend/app/templates/qa_bank.html`（新增）、`backend/app/templates/qa_bank_suggest.html`（新增）、`backend/app/templates/merge_conflicts.html`（新增）、`backend/app/templates/base.html`、`backend/app/templates/profile.html`、`backend/app/templates/position_detail.html`、`backend/app/templates/resume_result.html`、`backend/tests/test_resume_tailor.py`、`backend/tests/test_resume_pdf.py`（新增）、`backend/tests/test_qa_bank_service.py`（新增）、`backend/tests/test_profile_service.py`、`backend/tests/test_dashboard.py`
 
 ---
+
+## Phase 3：插件抓取 LinkedIn 职位（2026-09-12）
+
+### 目标
+
+把 Phase 1 就设计好的插件配对鉴权基座真正用起来：在插件里实现 LinkedIn 职位详情页的解析，让用户不用再手动复制粘贴 JD 全文，一键就能把当前浏览的职位发进本地 App，走 Phase 1 已经跑通的入库/打分链路。按实施方案 v1 版本对这个 Phase 定的自测要求，重点不是"能不能抓到"，而是"抓不到的时候有没有老实认怂"——LinkedIn 的页面结构完全不受我们控制，随时可能改版，抓取逻辑必须经得起"选择器突然失效"这种情况，不能在识别失败时拿错误数据糊弄用户。
+
+### 实现内容
+
+- **后端新增插件专用接口 `POST /api/jobs`**（`backend/app/api/routes_extension.py`，新增路由文件）：复用 `require_paired_request` 这套 Phase 0 就定好的配对鉴权（校验 `X-JobPilot-Token` + Origin 必须是 `chrome-extension://` 开头），请求体校验后直接调用 Phase 1 的 `jd_ingest.create_jd` 入库，和 Dashboard 手动粘贴 JD 走的是完全同一条入库逻辑（同一个函数），新入库的 JD 仍然停在 `pending` 状态——插件这一步明确只负责"把 JD 送进来"，是否要花 LLM 配额去分析，仍然由用户在 Dashboard 里手动点"分析"决定，插件不越权替用户触发。描述为空（页面识别彻底失败）时返回 422，不允许塞一条空记录进库。响应体包含 `dashboard_url`，方便插件直接打开对应的详情页。
+- **LinkedIn 抓取纯函数**（`extension/content_scripts/linkedin_parser.js`，新增）：`extractLinkedInJob(doc, locationHref)` 只读 DOM、不发网络请求，职位标题/公司名/地点+附加信息行/正文四类字段各自准备了 4-5 套按优先级排列的选择器（覆盖观察到的"新版详情页 `job-details-jobs-unified-top-card__*`"、"稍旧版 `jobs-unified-top-card__*`"、"更旧的公开职位页 `topcard__*`"三种常见布局），全部选择器都找不到就返回 `null`，绝不用错误的兜底值冒充真实数据。地点和附加信息行（"Toronto, ON · 2 weeks ago · 80 people clicked apply"这类）来自同一处 DOM，原文整行保留下来交给后端已有的 `parse_extra_meta_rules` 做规则解析。因为是纯函数、不依赖任何 `chrome.*` API，可以完全脱离真实浏览器用 jsdom 做单元测试。
+- **内容脚本注入悬浮按钮**（`extension/content_scripts/linkedin.js`，新增）：`manifest.json` 新增 `content_scripts` 声明，匹配 `https://www.linkedin.com/jobs/*`，在页面右下角注入一个"发送到 JobPilot"悬浮按钮。点击时才调用 `extractLinkedInJob` 读取当前 DOM（不在脚本加载时就抓一次缓存起来）——LinkedIn 的职位列表页是单页应用，切换职位卡片通常不会触发页面刷新、也就不会重新执行内容脚本，把抓取放在点击那一刻，保证不管用户浏览过多少个职位，点击时读到的永远是当前这个职位的最新 DOM。按钮本身只做 DOM 读取和消息转发，不直接发网络请求（原因见下面"设计取舍"）。
+- **background 转发抓取结果**（`extension/background/service_worker.js`）：新增 `jobpilot:send-job` 消息处理，用已经存好的配对 token 发起 `POST /api/jobs`，成功后 `chrome.tabs.create` 自动打开返回的 `dashboard_url`；对"还没配对"“连不上本地 App”“本地 App 返回错误”三种失败原因分别给出不同的提示文案，回传给内容脚本更新按钮状态，而不是一个笼统的"失败"。
+- **侧边栏新增功能提示卡片**：只在"已连接"状态下显示，告诉用户"打开 LinkedIn 职位页会有一个按钮"，避免这个功能完全隐藏在用户不知道的地方。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **抓取网络请求必须在 background 发起，不能在内容脚本里直接 fetch**：这不是新加的限制，是 Phase 0 配对鉴权设计（Origin 必须是 `chrome-extension://` 开头）的直接推论——内容脚本运行在页面自己的执行上下文里，发起的请求 Origin 头是 `https://www.linkedin.com`，天然过不了后端的 Origin 校验。这条记录进了第六节关键设计决策表，避免以后有人为了图方便在内容脚本里直接发请求，排查半天才发现是 Origin 被拒绝。
+2. **插件只负责"送 JD 进来"，不自动触发分析**：一键发送后停在 `pending` 状态、跳转到 Dashboard 详情页，由用户自己点"分析"，而不是插件自动帮用户消耗一次 LLM 调用。这样即使用户还没配置好模型、或者只是想先看看抓取的内容对不对，也不会有一次"意外"的分析请求被发出去。
+3. **按钮点击时才抓取，不做页面加载时的自动抓取或缓存**：一方面避免用户还没决定要不要发送、页面就已经做了一次没必要的抓取；另一方面天然解决了"LinkedIn 单页应用切换职位不重新执行内容脚本"这个问题，不需要额外写 SPA 路由监听逻辑。
+4. **按钮的兜底重新注入用低频 `setInterval` 而不是 `MutationObserver`**：LinkedIn 页面本身会频繁增删 DOM 节点，监听整个 `body` 子树变化的 `MutationObserver` 在这种页面上开销不小，而这个按钮并不需要对页面变化做到毫秒级响应，用一个 3 秒一次的轻量检查换取更简单、更不容易引入额外性能问题的实现。
+5. **选择器兜底策略是"抓不到就留空"而不是"抓不到就用页面标题之类的模糊替代"**：任何"看起来大概率对但不保证对"的兜底都不采用——比如公司名找不到时，不会退而求其次去猜测页面 `<title>` 里 `|` 分隔的某一段是公司名，因为一旦猜错，用户很容易信以为真直接拿去分析，比"明确留空、用户自己看到缺了什么去手动补"更糟。
+
+### 遇到的问题与解决
+
+**问题一：设计阶段就排除掉的一个方案——差点让内容脚本直接发起网络请求**
+
+现象：写第一版设计时，最直接的想法是内容脚本抓完数据直接 `fetch(...)` 发给本地 App，逻辑上一步到位。
+
+原因：没有立刻意识到内容脚本的请求 Origin 是页面自己的域名，会被后端 `require_paired_request` 的 Origin 校验拒绝——这条校验规则是 Phase 0 就写好的，但当时的场景只有 background 发起 WebSocket 连接，没有人在内容脚本里发过 REST 请求，这个隐含约束没有被显式记录下来。
+
+解决：写代码之前先对照 `app/api/deps.py` 里 `_origin_allowed` 的实现过了一遍，确认了这一点，把网络请求这一步设计成"内容脚本只读 DOM、消息转发给 background，由 background 发起请求"，从一开始就避免了这个问题，没有走弯路重写。这个坑本身没有花时间踩，但值得记下来、写进第六节的决策表，防止以后加新功能时重新掉进去。
+
+**问题二：第一版 fixture 里 "topcard__flavor-row" 元信息行没有真实的分隔符文本**
+
+现象：写 `layout_public_topcard.html` 这份测试 fixture 时，最初用三个相邻的 `<span>` 标签分别装"Remote"、"1 week ago"、"25 people clicked apply"，中间没有任何分隔文本，`extractLinkedInJob` 解析出来的 `location` 字段是整行拼起来的文本，而不是期望的"Remote"。
+
+原因：`_extractLocation` 是按 `·`/`•` 这类中点符号切分文本取第一段，这几个 `<span>` 之间在真实 LinkedIn 页面上是有一个字面的"·"分隔符渲染出来的，但我第一版手写的 fixture HTML 里漏掉了这个细节，导致测试用的模拟数据本身就不够真实，而不是解析逻辑有 bug。
+
+解决：在 fixture 里把分隔符明确写成文本节点 `<span>Remote</span> · <span>1 week ago</span> · <span>25 people clicked apply</span>`，让它更贴近真实页面的渲染结果，测试才转绿。这条也提醒自己：写模拟 HTML fixture 时，容易只关注"该出现的文字都出现了"，却忽略了文字之间的分隔符/标点这类容易被解析逻辑依赖到的细节。
+
+### 验证结果
+
+- 后端新增 `tests/test_routes_extension.py`（6 条：鉴权拦截三种场景、正常入库并能在 Dashboard 详情页查到、空描述被拒绝、只传必填字段时其余字段保持 `None`），加上此前 Phase 0-2 遗留的用例，`backend` 目录下共 **158 条 pytest 用例全部通过**，零回归。
+- 插件侧新增 `extension/content_scripts/linkedin_parser.test.js`（5 条，用 jsdom 加载新版/稍旧版/更旧公开职位页/完全无法识别布局四种模拟 LinkedIn 页面 HTML fixture，覆盖正常提取和字段缺失兜底两类场景），跑法是 `cd extension && npm install && npm test`，不需要真实 Chrome、不需要真实 LinkedIn 账号。
+- 新增 `extension/scripts/check_permissions.js` 静态权限检查复跑一遍确认通过（`manifest.json` 新增了 `content_scripts` 和 `host_permissions`，没有引入需要额外声明却漏掉的 `chrome.*` API）。
+- 先在云端沙盒环境跑通全部后端 pytest 和插件侧 Node 测试，再把改动同步到用户本机项目目录（`C:\liuzhibin\aI-agent\jobpilot`），逐文件 SHA-256 校验和确认同步无损坏，在设备侧独立 Linux 虚拟环境（`~/jobpilot_venv`）里重新跑一遍全部 pytest 用例，结果一致。真实 Chrome 加载插件、访问真实 LinkedIn 职位页点击"发送到 JobPilot"按钮这部分，云端沙盒没有图形界面、也没有 LinkedIn 账号，无法代为完成，验收清单写在 `README.md` 第五节，需要用户在自己电脑上手动过一遍。
+
+### 涉及文件
+
+`docs/JobPilot_实施方案.md`（v4，第八节 Phase 3 标记完成 + 第六节新增插件网络请求发起层的决策记录）、`README.md`（新增第五节：LinkedIn 抓取的测试方式和手动验收清单）、`backend/app/api/routes_extension.py`（新增）、`backend/app/main.py`（注册新路由）、`backend/tests/test_routes_extension.py`（新增）、`extension/manifest.json`（新增 `content_scripts` + `host_permissions`）、`extension/content_scripts/linkedin_parser.js`（新增）、`extension/content_scripts/linkedin.js`（新增）、`extension/content_scripts/linkedin_parser.test.js`（新增）、`extension/content_scripts/__fixtures__/`（新增，4 份模拟页面布局）、`extension/background/service_worker.js`、`extension/sidepanel/sidepanel.html`、`extension/sidepanel/sidepanel.js`、`extension/package.json`（新增，管理 jsdom 开发依赖）、`extension/package-lock.json`（新增）
+
+---

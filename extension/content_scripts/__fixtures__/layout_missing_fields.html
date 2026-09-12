@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Some unrelated page title</title>
+  </head>
+  <body>
+    <!-- 故意什么已知选择器都不命中：模拟 LinkedIn 改版、或者页面还没完全加载完成
+         就被抓取的情况。此时抓取函数应该老老实实返回 null / 空字符串,不能瞎猜。 -->
+    <div class="totally-unrecognized-layout">
+      <p>This page does not match any known LinkedIn layout.</p>
+    </div>
+  </body>
+</html>

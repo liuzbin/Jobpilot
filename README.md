@@ -1,25 +1,23 @@
-# JobPilot — Phase 0 + Phase 1
+# JobPilot
 
-Phase 0 目标：本地 App（FastAPI + SQLite）能独立跑起来，数据库结构完整；Chrome 插件能检测到本地 App、完成配对、并维持心跳连接。这是后续所有功能（画像、打分、简历重制、自动填表）的地基。
-
-Phase 1 目标：跑通"端到端打分闭环"——上传简历自动建立/补全画像、粘贴 JD 自动结构化解析、点一下"分析"得到一个可解释且**可复现**的匹配分数，全部通过本地浏览器打开的 Dashboard 页面操作，不需要用到插件。
+本地优先的求职助手：Chrome 插件 + 本地常驻 App（FastAPI + SQLite），不依赖任何云端服务器。当前进度见 `docs/DEVELOPMENT_LOG.md`（每个 Phase 的实现过程、踩坑与解决）和 `docs/JobPilot_实施方案.md`（分阶段实施计划的唯一依据）。下面这份 README 主要是"怎么把本地 App 和插件跑起来、怎么验收"的操作手册，按 Phase 0 的顺序写的，后面几个 Phase 新增的验证步骤追加在对应小节里。
 
 ## 目录结构
 
 ```
 jobpilot/
-├── backend/          # 本地 App（Python / FastAPI）
+├── backend/                     # 本地 App（Python / FastAPI）
 │   ├── app/
-│   │   ├── core/     # 配置、数据库连接、配对 token、自动迁移、LLM 客户端、密钥加密存储
-│   │   ├── models/   # SQLAlchemy 表结构
-│   │   ├── services/ # 业务逻辑：简历解析、JD 解析、打分引擎、画像合并
-│   │   ├── templates/# Dashboard 用的 Jinja2 模板
-│   │   └── api/      # REST + WebSocket 路由 + Dashboard 路由
-│   ├── alembic/      # 数据库迁移脚本
-│   └── tests/        # pytest 自动化测试
-└── extension/        # Chrome 插件（Manifest V3）
-    ├── background/   # service worker：连接状态机、心跳
-    └── sidepanel/    # 侧边栏 UI：配对、状态展示
+│   │   ├── core/                # 配置、数据库连接、配对 token、自动迁移
+│   │   ├── models/               # SQLAlchemy 表结构
+│   │   ├── services/             # 画像/JD/打分/简历重制等业务逻辑
+│   │   └── api/                  # REST + WebSocket 路由（routes_system 配对与插件专用接口，routes_dashboard 本地浏览器页面）
+│   ├── alembic/                  # 数据库迁移脚本
+│   └── tests/                    # pytest 自动化测试
+└── extension/                    # Chrome 插件（Manifest V3）
+    ├── background/                # service worker：连接状态机、心跳、转发插件抓取到的 JD 给本地 App
+    ├── content_scripts/           # 注入到 LinkedIn 职位页的抓取脚本（Phase 3）+ 对应的 jsdom 回归测试
+    └── sidepanel/                 # 侧边栏 UI：配对、状态展示
 ```
 
 ## 一、启动本地 App
@@ -46,14 +44,7 @@ source .venv/bin/activate
 python -m pytest -v
 ```
 
-当前共 56 条用例：
-
-1. **数据库迁移**（`test_migrations.py`）：从空目录跑 `alembic upgrade head` 能一次性建出全部 8 张业务表，重复运行不报错，并且不会误禁用 uvicorn/app 自己的日志 logger。
-2. **配对握手**（`test_handshake.py`）：`/api/health` 无需鉴权即可探活；`/api/status` 在缺 token / 错误 token / 错误 Origin 时分别返回 401 或 403，只有 token 和 Origin 都正确才放行；`/ws/heartbeat` 的 ping/pong 在鉴权通过后正常工作。
-3. **画像合并逻辑**（`test_profile_service.py`）：公司/项目按名称模糊匹配复用或新增、贡献句去重、简历抽取只填空字段不覆盖已有值。
-4. **JD 规则解析**（`test_jd_ingest.py`）：LinkedIn 附加信息行（申请人数、发布时间、是否推广）的纯正则解析，多次调用结果完全一致。
-5. **打分引擎**（`test_scoring.py`）：核心是"同样的输入无论调用多少次，输出必须完全一致"这条确定性断言，另外覆盖学历/清关不满足时的扣分、年限差扣分（含封顶）、加分技能（含封顶）、总分 clamp 到 [0,100] 等边界场景。
-6. **Dashboard 路由**（`test_dashboard.py`）：画像编辑、简历上传解析、JD 新建、模型配置保存、一键分析（用 `FakeLLMClient` 模拟真实模型返回，不需要真实 API Key 和网络）、以及跨站请求防护。
+Phase 0 阶段是 12 条用例，覆盖数据库迁移和配对握手两类验收点；后面每个 Phase 都在原有基础上继续补充，覆盖范围随功能一起长（画像/JD 解析、打分引擎、简历重制、事实护栏校验、PDF 渲染、插件专用 API 等），具体每个 Phase 新增了什么测试、当时的用例总数是多少，见 `docs/DEVELOPMENT_LOG.md` 对应章节的"验证结果"小节——这里不再逐个 Phase 重复维护一份可能过时的数字，跑一遍上面的命令看实际输出的用例总数和是否全部通过就是最新的真实状态。
 
 ## 三、检查插件权限声明（无需 Chrome，命令行即可）
 
@@ -75,7 +66,7 @@ node scripts/check_permissions.js
 4. 点击浏览器工具栏里的 JobPilot 图标，应该会打开侧边栏。
 5. 如果侧边栏一直卡在某个状态没反应，打开 `chrome://extensions`，找到 JobPilot 卡片上的"service worker"或"检查视图"链接，点进去看控制台有没有报错——这是插件侧最直接的排查手段，以后遇到类似问题可以先看这里。
 
-### Phase 0 验收清单
+### 验收清单
 
 - [ ] 本地 App 未启动时，侧边栏显示"未连接"，并提示"还没检测到本地 App"。
 - [ ] 启动本地 App 后（不用手动刷新），大约 1 分钟内或点击"重新检测"后，侧边栏状态变为"已检测到本地 App，待配对"。
@@ -85,28 +76,40 @@ node scripts/check_permissions.js
 - [ ] 重新启动本地 App，侧边栏应自动重新连接（不需要重新输入配对码，因为 token 是持久化在两边的），除非你之前手动清过配对码或本地 App 的 `~/.jobpilot/pairing_token.json` 被删除重新生成过。
 - [ ] 故意在侧边栏输入一个错误的配对码，应该看到"配对失败"提示，且不会无限重试同一个坏 token。
 
-## 五、使用 Dashboard（画像 / JD 分析 / 模型配置）
+以上全部打勾即代表 Phase 0 验收通过，可以进入 Phase 1（端到端打分闭环：画像上传解析、JD 结构化、打分引擎、最简 Dashboard）。
 
-Dashboard 是本地 App 自带的网页界面，启动本地 App 后直接在浏览器打开 `http://127.0.0.1:8756/dashboard/jobs` 即可，不需要用到 Chrome 插件。
+## 五、抓取 LinkedIn 职位（Phase 3）
 
-1. **先配置模型**：打开"模型配置"页面（`/dashboard/models`），分别填写"轻量模型"和"重量模型"两个槽位的 Base URL（填到 `/v1` 这一级，比如 `https://api.openai.com/v1`）、模型名称、API Key。任意 OpenAI 兼容的 Chat Completions 接口都可以填，两个槽位可以指向完全不同的模型/服务商。API Key 会加密后存在本地，页面上不会明文回显。
-2. **建立画像**：打开"画像"页面（`/dashboard/profile`），可以直接手动填写基本信息，也可以上传一份简历文件（支持 `.pdf`/`.docx`/`.txt`/`.md`），系统会用"轻量模型"自动抽取工作经历和基本信息合并进画像——已经手动填过的基本信息字段不会被覆盖，工作经历按公司/项目名称自动去重合并。
-3. **粘贴 JD 并分析**：打开"职位"页面（`/dashboard/jobs`），点"新建"粘贴一段 JD 原文（公司、职位、地点等可选），保存后进入详情页点击"分析"，系统会用"轻量模型"结构化解析 JD、用"重量模型"判断技能契合度和硬性要求，最终分数由固定规则计算得出，多次点击"重新分析"同一份 JD 和画像，分数应该完全一致。
+打开一个 LinkedIn 职位详情页，页面右下角会出现一个"发送到 JobPilot"悬浮按钮，点一下就会把这条职位的公司、岗位、正文、地点、"X people clicked apply"这类附加信息一起发给本地 App，自动打开对应的 Dashboard 详情页——接下来的分析、简历重制流程和手动粘贴 JD 完全一样，走的是同一条入库/打分链路。
 
-### Phase 1 验收清单
+### 不需要 Chrome 的回归测试
 
-- [ ] 未配置任何模型时，上传简历或点击"分析"，应该看到"还没配置"这样的友好提示，而不是报错页面。
-- [ ] 配置好轻量/重量两个模型槽位后，上传一份真实简历，能看到"解析完成：新增 X 家公司、Y 段经历、Z 条贡献句"的提示，画像页面能看到对应的工作经历树。
-- [ ] 再次上传同一份（或高度相似的）简历，重复的经历/贡献句不应该被重复插入。
-- [ ] 粘贴一段真实 JD 并分析，详情页能看到总分、扣分/加分明细、优势与劣势列表。
-- [ ] 对同一份 JD 点击"重新分析"多次，总分和各项明细完全一致（这是打分引擎"确定性"要求的直接体现）。
-- [ ] `python -m pytest -v` 全部 56 条用例通过。
+LinkedIn 的页面结构不受我们控制、也会不定期调整，抓取逻辑单独抽成一个不依赖浏览器的纯函数（`extension/content_scripts/linkedin_parser.js`），用 [jsdom](https://github.com/jsdom/jsdom) 模拟几种常见的 LinkedIn 页面布局（新版详情页、稍旧版、更旧的公开职位页、完全无法识别的布局）跑单元测试，可以在没有 Chrome、没有真实 LinkedIn 账号的情况下随时验证：
 
-以上全部打勾即代表 Phase 1 验收通过，可以进入 Phase 2（画像深化与简历重制）。
+```bash
+cd jobpilot/extension
+npm install       # 第一次跑之前装一下开发依赖（只有 jsdom，运行插件本身不需要）
+npm test          # 等价于 node content_scripts/linkedin_parser.test.js
+```
+
+正常应该看到 5 条用例全部 `ok`。如果哪天发现插件在真实 LinkedIn 页面上抓不到某个字段了，优先的排查方式是：把当时页面的 HTML 存一份到 `extension/content_scripts/__fixtures__/`，在 `linkedin_parser.test.js` 里加一条新用例复现问题，再去 `linkedin_parser.js` 里补一条新的选择器分支——而不是直接改代码之后祈祷它在真实页面上碰巧好使。
+
+### 需要在真实 Chrome + 真实 LinkedIn 页面上手动验收的部分
+
+云端环境没有图形界面、也没有 LinkedIn 账号，下面这些必须你在自己电脑上手动确认：
+
+- [ ] 按上面"四、加载 Chrome 插件"重新加载一次插件（`manifest.json` 新增了 `content_scripts` 和 `host_permissions`，必须整个重新加载才会生效，不能只刷新侧边栏）。
+- [ ] 在已连接状态下打开侧边栏，应该能看到新的"抓取 LinkedIn 职位"提示卡片。
+- [ ] 访问几个不同的真实 LinkedIn 职位详情页（`linkedin.com/jobs/view/...`），页面右下角应该都能看到"发送到 JobPilot"悬浮按钮。
+- [ ] 点击按钮，按钮文案应该依次变化："发送中…" → "已发送，正在打开…"，同时自动新开一个标签页跳转到本地 Dashboard 对应 JD 的详情页，公司名、职位名、正文都应该和 LinkedIn 页面上看到的一致。
+- [ ] 在 LinkedIn 的职位列表页里，不刷新页面、直接点击切换到另一个职位卡片，再点按钮，应该发送的是切换后这个新职位的信息（验证"单页应用切换职位不需要刷新页面"这条设计）。
+- [ ] 故意在还没完成插件配对的状态下点击按钮，按钮应该提示"还没有完成配对，请先在侧边栏完成配对再试一次"，而不是无提示地失败。
+- [ ] 打开一个明显不是职位详情页的 LinkedIn 页面（比如个人主页），确认按钮没有出现（`content_scripts` 的 `matches` 规则只匹配 `linkedin.com/jobs/*`）。
+
+以上全部打勾即代表 Phase 3 验收通过。
 
 ## 安全说明
 
 - 配对 token 保存在本地文件 `~/.jobpilot/pairing_token.json`，不要把这个文件或其中的内容分享给别人。
-- 模型的 API Key 经对称加密后保存在本地文件 `~/.jobpilot/secrets_store.json`，加密密钥单独存放在 `~/.jobpilot/secret.key`（权限限制为仅当前用户可读），同样不要分享这两个文件。
-- 本地服务插件相关接口（`/api/*`、`/ws/*`）都同时校验"配对 token"和"请求来源（Origin 必须是 `chrome-extension://` 开头）"；Dashboard 相关接口（`/dashboard/*`）因为是用户直接用浏览器打开的普通页面，不走配对 token，但会拒绝来自其他站点的跨站请求。
-- 目前插件侧 Origin 校验只要求前缀是 `chrome-extension://`，尚未锁定到具体插件 ID；插件正式打包发布、拿到固定 ID 后，建议通过环境变量 `JOBPILOT_ALLOWED_ORIGIN` 把它锁死到那一个具体来源，这个会在后续打磨阶段处理。
+- 本地服务的所有需要鉴权的接口都同时校验"配对 token"和"请求来源（Origin 必须是 `chrome-extension://` 开头）"，防止你打开的其他网页伪装成插件向本地 App 发请求。
+- 目前 Origin 校验只要求前缀是 `chrome-extension://`，尚未锁定到具体插件 ID；插件正式打包发布、拿到固定 ID 后，建议通过环境变量 `JOBPILOT_ALLOWED_ORIGIN` 把它锁死到那一个具体来源，这个会在后续打磨阶段处理。

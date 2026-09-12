@@ -129,6 +129,51 @@ function ensureHealthPollAlarm() {
   }
 }
 
+/**
+ * Phase 3：把内容脚本（LinkedIn 页面）抓到的 JD 发给本地 App。
+ *
+ * 之所以这一步放在 background 而不是内容脚本里直接 fetch：内容脚本的网络
+ * 请求 Origin 头是页面自己的域名（https://www.linkedin.com），过不了后端
+ * `require_paired_request` 的 Origin 校验；只有从插件自己的执行上下文
+ * （background/侧边栏，Origin 是 chrome-extension://...）发起的请求才会
+ * 带上插件的 Origin，这是 Phase 0 就定下的配对鉴权设计的直接推论。
+ */
+async function sendJobToLocalApp(payload) {
+  const token = await getToken();
+  if (!token) {
+    return { ok: false, error: "还没有完成配对，请先在侧边栏完成配对再试一次" };
+  }
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-JobPilot-Token": token },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    return { ok: false, error: "连不上本地 App，请确认它正在运行" };
+  }
+  if (!resp.ok) {
+    let detail = `本地 App 返回错误 (${resp.status})`;
+    try {
+      const body = await resp.json();
+      if (body?.detail) detail = body.detail;
+    } catch (e) {
+      // 响应体不是 JSON 就用上面的默认文案,不额外报错
+    }
+    return { ok: false, error: detail };
+  }
+  const body = await resp.json();
+  try {
+    await chrome.tabs.create({ url: body.dashboard_url });
+  } catch (e) {
+    // 打开新标签页失败(极少见)不应该让"已经发送成功入库"这个事实被掩盖掉,
+    // 仍然回报成功,只是带上这条附加信息。
+    return { ok: true, dashboard_url: body.dashboard_url, warning: "已入库，但自动打开页面失败，请手动去 Dashboard 查看" };
+  }
+  return { ok: true, dashboard_url: body.dashboard_url };
+}
+
 // 消息监听器最先注册：这是侧边栏"重新检测"按钮能不能响应的关键,
 // 不应该排在任何可能抛异常的代码之后。
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -139,6 +184,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "jobpilot:get-state") {
     sendResponse({ state });
     return false;
+  }
+  if (message?.type === "jobpilot:send-job") {
+    sendJobToLocalApp(message.payload || {}).then(sendResponse);
+    return true; // 保持通道打开,等待异步 sendResponse
   }
   return false;
 });

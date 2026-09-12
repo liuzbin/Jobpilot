@@ -1,12 +1,12 @@
 # JobPilot 实施方案
 
-版本：v3（Phase 2 补完收尾：事实字段护栏校验、PDF 渲染、qa_bank 问答收集、工作经历树增删改交互全部落地）　日期：2026-09-12　作者：liuzbin
+版本：v4（Phase 3 完成：插件抓取 LinkedIn 职位）　日期：2026-09-12　作者：liuzbin
 
 说明：本项目由 liuzbin 主导产品设计与决策，开发过程中与 AI 助手 Claude（Anthropic）协作完成方案撰写与编码实现。
 
-本方案基于产品描述以及历次讨论结果整理而成，作为分阶段编码的唯一依据。每次进入新阶段前，如发现与本方案冲突的地方，先回来更新本文档，再动代码——这是从 v1 就定下的规则，v2 版本是这条规则的一次实践（在开始 Phase 2 编码之前先把"核心价值主张"和"画像深化"部分的设计谈清楚、写进来）。本版本（v3）记录的是另一次实践：Phase 2 代码落地过程中先交付了访谈/三元组/简历重制主链路就报告"完成"，但对照本文档第八节 Phase 2 清单逐项自查后发现还有 4 项没有真正做完（事实字段护栏校验、PDF 渲染、qa_bank 问答收集流程、工作经历树的增删改交互），确认后全部补齐，才算 Phase 2 真正验收通过，再进入 Phase 3。
+本方案基于产品描述以及历次讨论结果整理而成，作为分阶段编码的唯一依据。每次进入新阶段前，如发现与本方案冲突的地方，先回来更新本文档，再动代码——这是从 v1 就定下的规则。v2 是这条规则的一次实践（Phase 2 编码前先谈清楚"核心价值主张"和"画像深化"的设计）；v3 是另一次实践（Phase 2 代码落地过程中先交付主链路就报告"完成"，对照第八节清单自查后发现还有 4 项没做完，补齐后才算真正验收通过）；本版本（v4）记录 Phase 3——插件抓取 LinkedIn 职位——完成并通过验收。
 
-截至本版本，Phase 0（本地 App + 插件基座）、Phase 1（端到端打分闭环）、Phase 2（画像深化与简历重制，含本次补完的 4 项）均已完成并通过验收，代码已提交至 GitHub（`https://github.com/liuzbin/Jobpilot.git`），每个阶段的实现过程、遇到的问题与解决方式记录在 `docs/DEVELOPMENT_LOG.md`。
+截至本版本，Phase 0（本地 App + 插件基座）、Phase 1（端到端打分闭环）、Phase 2（画像深化与简历重制，含补完的 4 项）、Phase 3（插件抓取 LinkedIn 职位）均已完成并通过验收，代码已提交至 GitHub（`https://github.com/liuzbin/Jobpilot.git`），每个阶段的实现过程、遇到的问题与解决方式记录在 `docs/DEVELOPMENT_LOG.md`。
 
 ## 一、核心价值主张
 
@@ -117,12 +117,13 @@ JD 由用户手动粘贴全文，轻量模型做结构化解析，LinkedIn 附�
 | 技能延伸的产生和落地方式（本次新增） | 若由模型在生成阶段直接、静默地把延伸技能写进简历，用户可能意识不到哪些是延伸出来的，也就没法有意识地去补课 | 延伸出的每条建议三元组必须先展示判断依据、经用户逐条确认后才写入简历；确认过的持久化进 `claimed_skill` 表供以后复用，但每次生成仍需轻量确认，不自动静默采用 |
 | 认领技能库是否计入打分（本次新增） | 直觉上"用户认领了某技能"似乎应该让匹配分更高 | 明确不计入：`compute_score` 只读真实画像数据，打分要对用户保持诚实，这是"核心价值主张"（第一节）能够成立的前提 |
 | 单画像/多画像（v1） | 未定 | 单画像方案（一台电脑一份画像），MVP 更简单，已在 Phase 0 落地 |
+| 插件抓取到 JD 之后网络请求在哪一层发起（Phase 3 新增） | 直觉上可以在内容脚本里抓完数据直接 fetch 发给本地 App，逻辑最直接 | 内容脚本运行在页面自己的执行上下文里，fetch 请求的 Origin 头是页面域名（`https://www.linkedin.com`），过不了 `require_paired_request` 的 Origin 校验；改成内容脚本只读 DOM、把结果转发给 background，由 background（Origin 是 `chrome-extension://...`）发起请求，这是 Phase 0 配对鉴权设计的直接推论，不是新增的限制 |
 
 ## 七、技术栈总览
 
 本地 App：Python 3.11+、FastAPI（REST + WebSocket）、SQLAlchemy + Alembic、SQLite、Pydantic、pdfplumber + python-docx（简历解析）、Jinja2 + WeasyPrint（简历渲染，WeasyPrint 待 Phase 2 引入）、cryptography（密钥加密存储）、numpy（相似度计算，待 Phase 4 引入）。
 
-浏览器插件：Chrome Manifest V3、JavaScript、Side Panel API、内容脚本 + 后台 service worker、原生 WebSocket 客户端。
+浏览器插件：Chrome Manifest V3、JavaScript、Side Panel API、内容脚本 + 后台 service worker、原生 WebSocket 客户端；抓取逻辑的纯函数部分用 jsdom 做脱离真实 Chrome 环境的 Node 单元测试（Phase 3 引入，仅开发期依赖，插件运行时不需要）。
 
 Dashboard：Jinja2 服务端渲染 + 少量原生 JS，已在 Phase 1 落地。
 
@@ -142,7 +143,7 @@ Dashboard：Jinja2 服务端渲染 + 少量原生 JS，已在 Phase 1 落地。
 
 自测方式：对同一份画像+JD 分别跑 K=0/K=5/K=10 三档，人工核对 K=0 确实只是重排、K=10 的延伸建议是否都能在项目背景里找到依据、且必须经用户确认才生效；写自动化校验测试，故意在生成结果里注入一个不存在的公司名，断言护栏校验能拦截（`test_resume_tailor.py` 的"事实字段护栏校验"用例组，含命中项回退、延伸建议丢弃两条路径）；构造一个"`claimed_skill` 里已认领某技能"的用例，断言打分引擎 `compute_score` 的分数不受影响（回归测试，守住"打分诚实"这条底线）；用 `HTML(string=...).render().pages` 检查生成的 PDF 在不同长度简历下排版是否稳定分页、不错位截断。
 
-**Phase 3 — 插件抓取 JD**：（与 v1 一致）LinkedIn 职位详情页的内容脚本解析，一键发送给本地 App 走已有的打分链路。
+**Phase 3 — 插件抓取 JD（已完成，见 `docs/DEVELOPMENT_LOG.md`）**：✅ LinkedIn 职位详情页的内容脚本解析（公司、职位、正文、地点、"X people clicked apply"等附加信息），页面右下角悬浮按钮一键发送，新增插件专用的配对鉴权 REST 接口 `POST /api/jobs` 入库，和 Dashboard 手动粘贴 JD 走完全相同的入库/打分链路（插件这一步只负责"送进来"，分析动作仍由用户在 Dashboard 里手动触发，不会替用户静默消耗 LLM 配额）。抓取逻辑抽成不依赖浏览器的纯函数，用 jsdom 模拟多种页面布局做自动化回归测试。
 
 **Phase 4 — 自动化填表**：（与 v1 一致）Workday/Greenhouse/Lever 选择器规则 + 通用兜底识别、题库相似度检索与自动填充、提交按钮监听与状态推进。
 
@@ -156,4 +157,4 @@ Dashboard：Jinja2 服务端渲染 + 少量原生 JS，已在 Phase 1 落地。
 
 ## 十、下一步行动
 
-Phase 2（含本次补完的 4 项）已全部完成并通过验收：全部 152 条 pytest 用例先在云端沙盒跑通，再同步到本机项目目录、在本机独立 Linux 执行环境里重新装依赖、重新跑一遍全部用例，结果一致。下一步进入 **Phase 3 — 插件抓取 JD**：LinkedIn 职位详情页的内容脚本解析，一键发送给本地 App 走已有的打分链路。
+Phase 3（插件抓取 LinkedIn 职位）已完成并通过验收：后端新增的 `POST /api/jobs` 接口连同全量 pytest 用例先在云端沙盒跑通，插件侧的抓取纯函数用 jsdom 做了多种页面布局的回归测试，再把改动同步到本机项目目录、在本机独立 Linux 执行环境里重新跑一遍全部 pytest 用例，结果一致；真实 Chrome + 真实 LinkedIn 页面的手动验收清单见 `README.md` 第五节，由用户在自己电脑上完成。下一步进入 **Phase 4 — 自动化填表**：Workday/Greenhouse/Lever 选择器规则 + 通用兜底识别、题库相似度检索与自动填充、提交按钮监听与状态推进。

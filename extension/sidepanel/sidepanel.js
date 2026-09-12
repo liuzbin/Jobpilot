@@ -14,6 +14,7 @@ const statusDetail = document.getElementById("status-detail");
 const retryBtn = document.getElementById("retry-btn");
 const pairingCard = document.getElementById("pairing-card");
 const notDetectedCard = document.getElementById("not-detected-card");
+const linkedinHintCard = document.getElementById("linkedin-hint-card");
 const openPairPageBtn = document.getElementById("open-pair-page-btn");
 const tokenInput = document.getElementById("token-input");
 const saveTokenBtn = document.getElementById("save-token-btn");
@@ -33,6 +34,7 @@ function render(state) {
   const needsPairing = state.status === "app_detected_unpaired" || state.status === "pairing_rejected";
   pairingCard.hidden = !needsPairing;
   notDetectedCard.hidden = state.status !== "disconnected";
+  linkedinHintCard.hidden = state.status !== "connected";
 }
 
 function showFatalError(text) {
@@ -44,7 +46,7 @@ function showFatalError(text) {
 function sendMessageSafe(message, callback) {
   chrome.runtime.sendMessage(message, (response) => {
     // 如果后台 service worker 压根没注册消息监听（比如权限配置错误导致脚本
-    // 提前抛异常退出），㆛�e.runtime.lastError 会被置位，response 是
+    // 提前抛异常退出），chrome.runtime.lastError 会被置位，response 是
     // undefined。不检查这个的话,侧边栏会一直卡在初始占位文案上,看起来
     // 像"检测中"卡死,但其实是后台脚本根本没跑起来。
     if (chrome.runtime.lastError) {

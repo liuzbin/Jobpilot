@@ -4,10 +4,17 @@
   "version": "0.1.0",
   "description": "JobPilot 求职助手插件：与本地 App 配合完成画像维护、JD 打分、简历重制与投递辅助。",
   "permissions": ["sidePanel", "storage", "alarms"],
-  "host_permissions": ["http://127.0.0.1:8756/*"],
+  "host_permissions": ["http://127.0.0.1:8756/*", "https://www.linkedin.com/*"],
   "background": {
     "service_worker": "background/service_worker.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/jobs/*"],
+      "js": ["content_scripts/linkedin_parser.js", "content_scripts/linkedin.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "side_panel": {
     "default_path": "sidepanel/sidepanel.html"
   },
