@@ -7,6 +7,35 @@
 </h1>
 <p class="muted">{{ jd.location or '' }}{% if jd.source_url %} · <a href="{{ jd.source_url }}" target="_blank">原始链接</a>{% endif %}</p>
 
+{% if jd.source_url %}
+<div class="card">
+  <button type="button" id="jobpilot-start-application-btn">去投递</button>
+  <p class="muted">点击会在新标签页打开投递页面，同时告诉插件"接下来这个标签页对应这条 JD"——如果这条职位刚好用的是插件认识的投递系统（Workday / Greenhouse / Lever），插件会在投递页面上提供自动填表；不管是不是这几家，投递页面上点击"提交"按钮后，只要还是这个标签页，都会自动把这条 JD 标记成"已投递"，不需要你回来手动改状态。</p>
+  {% if jd.status.value != 'applied' %}
+  <form method="post" action="/dashboard/jobs/{{ jd.id }}/mark-applied" style="margin-top:8px;">
+    <button type="submit" class="secondary">手动标记为已投递</button>
+  </form>
+  <p class="muted">插件没能自动识别到提交按钮、或者你没安装插件时，用这个按钮手动同步状态。</p>
+  {% endif %}
+</div>
+<script>
+  (function () {
+    var btn = document.getElementById("jobpilot-start-application-btn");
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      var detail = { jdId: {{ jd.id }}, targetUrl: {{ jd.source_url|tojson }} };
+      // 通过自定义 DOM 事件通知 dashboard_bridge.js 这个内容脚本（Dashboard
+      // 页面本身不能直接调用 chrome.storage 之类的扩展 API，只有注入到这个
+      // 页面的内容脚本才可以，所以这里用最普通的 window CustomEvent 做
+      // 页面脚本到内容脚本的桥接，具体原因见 extension/content_scripts/
+      // dashboard_bridge.js 顶部的说明）。
+      window.dispatchEvent(new CustomEvent("jobpilot:start-application", { detail: detail }));
+      window.open(detail.targetUrl, "_blank", "noopener");
+    });
+  })();
+</script>
+{% endif %}
+
 {% if jd.status.value in ('pending',) %}
 <div class="card">
   <form method="post" action="/dashboard/jobs/{{ jd.id }}/analyze">

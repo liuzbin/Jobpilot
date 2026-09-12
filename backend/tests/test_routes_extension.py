@@ -9,12 +9,16 @@ Dashboard 里查到对应记录。
 from __future__ import annotations
 
 import re
+import tempfile
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.api.deps_llm import get_light_client
 from app.core.db import get_sessionmaker
+from app.core.llm_client import FakeLLMClient
 from app.main import app
-from app.models.tables import JDRecord
+from app.models.tables import JDRecord, JDStatus, QABankEntry, ResumeVersion
 
 FAKE_EXTENSION_ORIGIN = "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef"
 
@@ -127,3 +131,172 @@ def test_submit_job_fills_only_provided_fields():
             assert jd.source_url is None
         finally:
             db.close()
+
+
+# ---------- Phase 4：自动化填表 ----------
+
+
+def test_autofill_plan_rejects_missing_auth():
+    with TestClient(app) as client:
+        r = client.post("/api/autofill/plan", json={"fields": []})
+        assert r.status_code == 403
+
+
+def test_autofill_plan_keyword_match_without_llm_configured():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        client.post("/dashboard/profile", data={"email": "a@example.com"})
+        r = client.post(
+            "/api/autofill/plan",
+            json={"fields": [{"field_id": "f1", "label": "Email Address", "input_type": "email"}]},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        plan = r.json()["plan"]
+        assert plan[0]["action"] == "fill"
+        assert plan[0]["value"] == "a@example.com"
+
+
+def test_autofill_plan_compliance_choice_field_always_skipped_even_with_llm_configured():
+    # 关键安全回归：哪怕轻量模型已配置、且模型把这个标签映射成了
+    # work_authorization,选择类控件也必须跳过——不能因为换成走 LLM 分支就
+    # 绕过了合规安全限制。
+    fake = FakeLLMClient(
+        responses=[{"mappings": [{"index": 0, "field_key": "work_authorization", "is_essay_question": False}]}]
+    )
+    app.dependency_overrides[get_light_client] = lambda: fake
+    try:
+        with TestClient(app) as client:
+            headers = _auth_headers(client)
+            client.post("/dashboard/profile", data={"work_authorization": "US Citizen"})
+            r = client.post(
+                "/api/autofill/plan",
+                json={
+                    "fields": [
+                        {
+                            "field_id": "f1",
+                            "label": "Do you require visa sponsorship?",
+                            "input_type": "radio",
+                            "options": [{"value": "yes", "label": "Yes"}, {"value": "no", "label": "No"}],
+                        }
+                    ]
+                },
+                headers=headers,
+            )
+            assert r.status_code == 200
+            plan = r.json()["plan"]
+            assert plan[0]["action"] == "skip"
+    finally:
+        app.dependency_overrides.pop(get_light_client, None)
+
+
+def test_autofill_qa_save_persists_entry():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.post(
+            "/api/autofill/qa-save",
+            json={"question_text": "为什么想加入我们公司", "answer_text": "因为贵公司的技术栈很吸引我"},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        assert r.json()["saved"] is True
+
+        db = get_sessionmaker()()
+        try:
+            entry = db.query(QABankEntry).filter(QABankEntry.question_text == "为什么想加入我们公司").first()
+            assert entry is not None
+            assert entry.answer_text == "因为贵公司的技术栈很吸引我"
+            assert entry.embedding is not None
+        finally:
+            db.close()
+
+
+def test_autofill_qa_save_blank_answer_not_saved():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.post(
+            "/api/autofill/qa-save",
+            json={"question_text": "一道问题", "answer_text": "   "},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        assert r.json()["saved"] is False
+
+
+def test_autofill_resume_pdf_404_when_jd_missing():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.get("/api/autofill/resume-pdf/9999", headers=headers)
+        assert r.status_code == 404
+
+
+def test_autofill_resume_pdf_404_when_no_resume_generated_yet():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        create = client.post(
+            "/dashboard/jobs",
+            data={"company": "Acme", "title": "Eng", "description_raw": "JD body text."},
+            follow_redirects=False,
+        )
+        jd_id = create.headers["location"].split("?")[0].rstrip("/").split("/")[-1]
+        r = client.get(f"/api/autofill/resume-pdf/{jd_id}", headers=headers)
+        assert r.status_code == 404
+
+
+def test_autofill_resume_pdf_returns_latest_version():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        create = client.post(
+            "/dashboard/jobs",
+            data={"company": "Acme", "title": "Eng", "description_raw": "JD body text."},
+            follow_redirects=False,
+        )
+        jd_id = int(create.headers["location"].split("?")[0].rstrip("/").split("/")[-1])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "resume.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake pdf content")
+
+            db = get_sessionmaker()()
+            try:
+                older = ResumeVersion(jd_id=jd_id, k_value=3, style_id="default", pdf_path=str(pdf_path))
+                db.add(older)
+                db.commit()
+                newer = ResumeVersion(jd_id=jd_id, k_value=5, style_id="default", pdf_path=str(pdf_path))
+                db.add(newer)
+                db.commit()
+            finally:
+                db.close()
+
+            r = client.get(f"/api/autofill/resume-pdf/{jd_id}", headers=headers)
+            assert r.status_code == 200
+            assert r.headers["content-type"] == "application/pdf"
+
+
+def test_mark_job_applied_updates_status():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        create = client.post(
+            "/dashboard/jobs",
+            data={"company": "Acme", "title": "Eng", "description_raw": "JD body text."},
+            follow_redirects=False,
+        )
+        jd_id = int(create.headers["location"].split("?")[0].rstrip("/").split("/")[-1])
+
+        r = client.post(f"/api/jobs/{jd_id}/mark-applied", headers=headers)
+        assert r.status_code == 200
+        assert r.json()["status"] == "applied"
+
+        db = get_sessionmaker()()
+        try:
+            jd = db.get(JDRecord, jd_id)
+            assert jd.status == JDStatus.APPLIED
+        finally:
+            db.close()
+
+
+def test_mark_job_applied_404_when_jd_missing():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.post("/api/jobs/9999/mark-applied", headers=headers)
+        assert r.status_code == 404

@@ -447,6 +447,21 @@ def job_analyze(
     return _redirect_with_flash(f"/dashboard/jobs/{jd_id}", "分析完成")
 
 
+@router.post("/jobs/{jd_id}/mark-applied", dependencies=[Depends(require_local_browser)])
+def job_mark_applied(jd_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    """Phase 4：手动兜底入口。插件那一套"去投递"关联 + 提交按钮监听（见
+    `app/api/routes_extension.py` 的同名接口）是尽力而为的自动化,不保证
+    100% 覆盖所有情况（比如某家 ATS 的提交按钮文案不在插件识别的关键词
+    模式里,或者用户压根没有安装插件),这里补一个手动按钮兜底,用户随时
+    可以自己在 Dashboard 上把状态标记成"已投递",不依赖插件是否成功监听到。"""
+    jd = db.get(JDRecord, jd_id)
+    if jd is None:
+        raise HTTPException(status_code=404, detail="JD not found")
+    jd.status = JDStatus.APPLIED
+    db.commit()
+    return _redirect_with_flash(f"/dashboard/jobs/{jd_id}", "已标记为已投递")
+
+
 # ---------- 模型配置 ----------
 
 

@@ -174,6 +174,147 @@ async function sendJobToLocalApp(payload) {
   return { ok: true, dashboard_url: body.dashboard_url };
 }
 
+/**
+ * Phase 4：自动化填表相关的几个网络调用，全部收在这里而不是内容脚本里
+ * 直接 fetch，原因和 sendJobToLocalApp 完全一样——内容脚本注入在 ATS
+ * 页面自己的执行上下文里，Origin 是那家 ATS 的域名，过不了后端的配对
+ * 鉴权，只有 background 发起的请求才带插件自己的 Origin。
+ */
+
+const PENDING_APPLICATION_TTL_MS = 30 * 60 * 1000; // 30 分钟
+
+async function fetchAutofillPlan(fields, jdId) {
+  const token = await getToken();
+  if (!token) {
+    return { ok: false, error: "还没有完成配对，请先在侧边栏完成配对再试一次" };
+  }
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/autofill/plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-JobPilot-Token": token },
+      body: JSON.stringify({ jd_id: jdId ?? null, fields }),
+    });
+  } catch (e) {
+    return { ok: false, error: "连不上本地 App，请确认它正在运行" };
+  }
+  if (!resp.ok) {
+    return { ok: false, error: `本地 App 返回错误 (${resp.status})` };
+  }
+  const body = await resp.json();
+  return { ok: true, plan: body.plan };
+}
+
+async function saveQaAnswer(questionText, answerText, jdId) {
+  const token = await getToken();
+  if (!token) {
+    return { ok: false, error: "还没有完成配对" };
+  }
+  try {
+    const resp = await fetch(`${API_BASE}/api/autofill/qa-save`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-JobPilot-Token": token },
+      body: JSON.stringify({ question_text: questionText, answer_text: answerText, jd_id: jdId ?? null }),
+    });
+    if (!resp.ok) return { ok: false, error: `本地 App 返回错误 (${resp.status})` };
+    const body = await resp.json();
+    return { ok: true, saved: body.saved };
+  } catch (e) {
+    return { ok: false, error: "连不上本地 App，请确认它正在运行" };
+  }
+}
+
+// 把 ArrayBuffer 编码成 base64 字符串按 chunk 处理,避免超大文件时
+// `String.fromCharCode(...bytes)` 一次性展开成函数参数导致调用栈溢出
+// （简历 PDF 一般不大，但没道理不做这个防御）。
+function _arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function fetchResumePdf(jdId) {
+  const token = await getToken();
+  if (!token) {
+    return { ok: false, error: "还没有完成配对" };
+  }
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/api/autofill/resume-pdf/${jdId}`, {
+      method: "GET",
+      headers: { "X-JobPilot-Token": token },
+    });
+  } catch (e) {
+    return { ok: false, error: "连不上本地 App，请确认它正在运行" };
+  }
+  if (!resp.ok) {
+    return { ok: false, error: resp.status === 404 ? "这条 JD 还没有生成过简历 PDF" : `本地 App 返回错误 (${resp.status})` };
+  }
+  const buffer = await resp.arrayBuffer();
+  const disposition = resp.headers.get("content-disposition") || "";
+  const filenameMatch = disposition.match(/filename="?([^";]+)"?/);
+  const filename = filenameMatch ? filenameMatch[1] : "resume.pdf";
+  return { ok: true, base64: _arrayBufferToBase64(buffer), filename };
+}
+
+async function markJobApplied(jdId) {
+  const token = await getToken();
+  if (!token) return { ok: false, error: "还没有完成配对" };
+  try {
+    const resp = await fetch(`${API_BASE}/api/jobs/${jdId}/mark-applied`, {
+      method: "POST",
+      headers: { "X-JobPilot-Token": token },
+    });
+    if (!resp.ok) return { ok: false, error: `本地 App 返回错误 (${resp.status})` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: "连不上本地 App，请确认它正在运行" };
+  }
+}
+
+/**
+ * Dashboard 页面点了"去投递"之后，记住"接下来打开的这个 hostname 对应
+ * 哪条 JD"，供之后在投递页面上点提交按钮时反查。按 hostname 存（而不是
+ * 单一的"最近一次"）是因为用户完全可能开着好几个 Dashboard 详情页的标签，
+ * 分别点"去投递"打开好几家公司的投递页，各自独立不应该互相覆盖。
+ * TTL 兜底清理：如果用户点了"去投递"但迟迟没有在对应页面上完成投递
+ * （或者压根没有真的跳转过去），这条记录不应该无限期占着，万一用户很久
+ * 之后凑巧又打开了同一个 hostname 的另一个职位投递页，不该被错误关联到
+ * 旧的那条 JD 上。
+ */
+async function rememberPendingApplication(jdId, hostname) {
+  if (!jdId || !hostname) return;
+  const { jobpilot_pending_applications: existing } = await chrome.storage.local.get("jobpilot_pending_applications");
+  const pending = existing || {};
+  pending[hostname] = { jdId, createdAt: Date.now() };
+  await chrome.storage.local.set({ jobpilot_pending_applications: pending });
+}
+
+/**
+ * 给 ats_autofill.js 用：查这个 hostname 有没有还没过期的待投递意图。
+ * 顺手清理掉已经过期的条目，避免这份存储无限增长。
+ */
+async function lookupPendingApplication(hostname) {
+  const { jobpilot_pending_applications: existing } = await chrome.storage.local.get("jobpilot_pending_applications");
+  const pending = existing || {};
+  const entry = pending[hostname];
+  const now = Date.now();
+  let changed = false;
+  for (const key of Object.keys(pending)) {
+    if (now - pending[key].createdAt > PENDING_APPLICATION_TTL_MS) {
+      delete pending[key];
+      changed = true;
+    }
+  }
+  if (changed) await chrome.storage.local.set({ jobpilot_pending_applications: pending });
+  if (!entry || now - entry.createdAt > PENDING_APPLICATION_TTL_MS) return null;
+  return entry.jdId;
+}
+
 // 消息监听器最先注册：这是侧边栏"重新检测"按钮能不能响应的关键,
 // 不应该排在任何可能抛异常的代码之后。
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -188,6 +329,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "jobpilot:send-job") {
     sendJobToLocalApp(message.payload || {}).then(sendResponse);
     return true; // 保持通道打开,等待异步 sendResponse
+  }
+  if (message?.type === "jobpilot:autofill-scan") {
+    const { fields, jdId } = message.payload || {};
+    fetchAutofillPlan(fields || [], jdId).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "jobpilot:save-qa") {
+    const { questionText, answerText, jdId } = message.payload || {};
+    saveQaAnswer(questionText, answerText, jdId).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "jobpilot:fetch-resume-pdf") {
+    const { jdId } = message.payload || {};
+    fetchResumePdf(jdId).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "jobpilot:submit-clicked") {
+    const { jdId } = message.payload || {};
+    markJobApplied(jdId).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "jobpilot:start-application") {
+    const { jdId, hostname } = message.payload || {};
+    rememberPendingApplication(jdId, hostname).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (message?.type === "jobpilot:lookup-pending-application") {
+    const { hostname } = message.payload || {};
+    lookupPendingApplication(hostname).then((jdId) => sendResponse({ jdId }));
+    return true;
   }
   return false;
 });

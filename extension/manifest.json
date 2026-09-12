@@ -4,7 +4,13 @@
   "version": "0.1.0",
   "description": "JobPilot 求职助手插件：与本地 App 配合完成画像维护、JD 打分、简历重制与投递辅助。",
   "permissions": ["sidePanel", "storage", "alarms"],
-  "host_permissions": ["http://127.0.0.1:8756/*", "https://www.linkedin.com/*"],
+  "host_permissions": [
+    "http://127.0.0.1:8756/*",
+    "https://www.linkedin.com/*",
+    "https://*.myworkdayjobs.com/*",
+    "https://*.greenhouse.io/*",
+    "https://*.lever.co/*"
+  ],
   "background": {
     "service_worker": "background/service_worker.js"
   },
@@ -12,6 +18,20 @@
     {
       "matches": ["https://www.linkedin.com/jobs/*"],
       "js": ["content_scripts/linkedin_parser.js", "content_scripts/linkedin.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.myworkdayjobs.com/*",
+        "https://*.greenhouse.io/*",
+        "https://*.lever.co/*"
+      ],
+      "js": ["content_scripts/ats_selectors.js", "content_scripts/form_scanner.js", "content_scripts/ats_autofill.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://127.0.0.1:8756/*"],
+      "js": ["content_scripts/dashboard_bridge.js"],
       "run_at": "document_idle"
     }
   ],

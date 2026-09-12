@@ -131,6 +131,39 @@ def test_job_create_then_detail_page_shows_it():
         assert "未分析" in detail.text
 
 
+def test_job_mark_applied_manually_updates_status_and_hides_button():
+    # Phase 4：手动兜底入口，覆盖插件没能自动识别到提交按钮、或者用户没
+    # 安装插件的情况。
+    with _client() as client:
+        create = client.post(
+            "/dashboard/jobs",
+            data={
+                "company": "Acme",
+                "title": "Backend Engineer",
+                "description_raw": "JD body text.",
+                "source_url": "https://jobs.lever.co/acme/abc-123",
+            },
+            follow_redirects=False,
+        )
+        detail_url = create.headers["location"].split("?")[0]
+
+        before = client.get(detail_url)
+        assert "手动标记为已投递" in before.text
+
+        r = client.post(f"{detail_url}/mark-applied", follow_redirects=True)
+        assert r.status_code == 200
+        assert "已标记为已投递" in r.text
+        assert "已投递" in r.text
+        # 已经是 applied 状态之后，手动标记按钮不应该再显示（没有意义了）
+        assert "手动标记为已投递" not in r.text
+
+
+def test_job_mark_applied_404_when_jd_missing():
+    with _client() as client:
+        r = client.post("/dashboard/jobs/9999/mark-applied")
+        assert r.status_code == 404
+
+
 def test_models_update_saves_config_and_encrypts_api_key():
     with _client() as client:
         r = client.post(

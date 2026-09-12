@@ -1,4 +1,5 @@
-"""Phase 2 补完：题库问答收集流程（app/services/qa_bank_service.py）。"""
+"""Phase 2 补完：题库问答收集流程（app/services/qa_bank_service.py）。
+Phase 4 补充：写入时自动落库 embedding、历史数据回填、相似度检索。"""
 
 from __future__ import annotations
 
@@ -7,11 +8,14 @@ from app.models.tables import ProfileBasic, QABankEntry, QASource
 from app.services.profile_service import get_or_create_profile_basic, update_profile_basic
 from app.services.qa_bank_service import (
     add_qa_entry,
+    backfill_qa_embeddings,
     delete_qa_entry,
+    find_similar_answer,
     generate_common_qa_questions,
     list_qa_entries,
     save_qa_answers,
 )
+from app.services.qa_similarity import bytes_to_embedding
 
 
 def test_generate_common_qa_questions_filters_blank_and_non_string(db_session):
@@ -84,3 +88,69 @@ def test_delete_qa_entry_removes_existing(db_session):
 
 def test_delete_qa_entry_missing_returns_false(db_session):
     assert delete_qa_entry(db_session, 9999) is False
+
+
+def test_add_qa_entry_computes_and_stores_embedding(db_session):
+    entry = add_qa_entry(db_session, "请介绍一下你自己", "我是一名数据工程师")
+    assert entry.embedding is not None
+    vector = bytes_to_embedding(entry.embedding)
+    assert vector.any()
+
+
+def test_add_qa_entry_update_recomputes_embedding(db_session):
+    add_qa_entry(db_session, "你的职业规划是什么", "第一版答案")
+    updated = add_qa_entry(db_session, "你的职业规划是什么", "第二版，完全不同的内容更长一些")
+    assert updated.embedding is not None
+
+
+def test_backfill_qa_embeddings_fills_legacy_null_entries(db_session):
+    # 模拟 Phase 2 时代写入、还没有 embedding 的历史记录：直接绕过
+    # add_qa_entry 手工插入一条 embedding=None 的记录。
+    legacy = QABankEntry(
+        question_text="历史遗留问题",
+        answer_text="历史答案",
+        source=QASource.ONBOARDING,
+        embedding=None,
+    )
+    db_session.add(legacy)
+    db_session.commit()
+
+    filled = backfill_qa_embeddings(db_session)
+    assert filled == 1
+
+    db_session.refresh(legacy)
+    assert legacy.embedding is not None
+
+
+def test_backfill_qa_embeddings_is_noop_when_nothing_missing(db_session):
+    add_qa_entry(db_session, "问题一", "答案一")
+    assert backfill_qa_embeddings(db_session) == 0
+
+
+def test_find_similar_answer_returns_best_match_above_threshold(db_session):
+    add_qa_entry(db_session, "请简单介绍一下你自己", "我是一名后端工程师，专注分布式系统")
+    add_qa_entry(db_session, "你期望的薪资范围是多少", "面议")
+
+    match, score = find_similar_answer(db_session, "请简单地自我介绍一下")
+    assert match is not None
+    assert match.question_text == "请简单介绍一下你自己"
+    assert score > 0.3
+
+
+def test_find_similar_answer_returns_none_when_below_threshold(db_session):
+    add_qa_entry(db_session, "你期望的薪资范围是多少", "面议")
+    match, score = find_similar_answer(db_session, "你会哪些编程语言")
+    assert match is None
+
+
+def test_find_similar_answer_empty_qa_bank_returns_none(db_session):
+    match, score = find_similar_answer(db_session, "任意问题")
+    assert match is None
+    assert score == 0.0
+
+
+def test_find_similar_answer_blank_question_returns_none(db_session):
+    add_qa_entry(db_session, "问题一", "答案一")
+    match, score = find_similar_answer(db_session, "   ")
+    assert match is None
+    assert score == 0.0

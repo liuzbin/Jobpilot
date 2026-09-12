@@ -5,7 +5,7 @@
   "description": "JobPilot Chrome 插件（Manifest V3）。这个 package.json 只用来管理开发期的 Node 测试依赖（jsdom），插件本身运行时不需要任何构建步骤，直接把 extension/ 目录作为已解压扩展程序加载到 Chrome 即可。",
   "scripts": {
     "check-permissions": "node scripts/check_permissions.js",
-    "test": "node content_scripts/linkedin_parser.test.js"
+    "test": "node content_scripts/linkedin_parser.test.js && node content_scripts/form_scanner.test.js && node content_scripts/ats_selectors.test.js"
   },
   "devDependencies": {
     "jsdom": "^30.0.1"

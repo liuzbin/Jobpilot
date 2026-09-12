@@ -299,3 +299,70 @@
 `docs/JobPilot_实施方案.md`（v4，第八节 Phase 3 标记完成 + 第六节新增插件网络请求发起层的决策记录）、`README.md`（新增第五节：LinkedIn 抓取的测试方式和手动验收清单）、`backend/app/api/routes_extension.py`（新增）、`backend/app/main.py`（注册新路由）、`backend/tests/test_routes_extension.py`（新增）、`extension/manifest.json`（新增 `content_scripts` + `host_permissions`）、`extension/content_scripts/linkedin_parser.js`（新增）、`extension/content_scripts/linkedin.js`（新增）、`extension/content_scripts/linkedin_parser.test.js`（新增）、`extension/content_scripts/__fixtures__/`（新增，4 份模拟页面布局）、`extension/background/service_worker.js`、`extension/sidepanel/sidepanel.html`、`extension/sidepanel/sidepanel.js`、`extension/package.json`（新增，管理 jsdom 开发依赖）、`extension/package-lock.json`（新增）
 
 ---
+
+## Phase 4：自动化填表（2026-09-12）
+
+### 目标
+
+在 Phase 3"插件把 JD 抓进来"的基础上，补上投递流程的另一端："插件把画像数据填进投递表单里"。编码开始前先针对实施方案 v1 遗留的两个开放问题（题库相似度检索用什么算法、提交按钮监听要不要联动 JD 状态推进）分别和用户确认了具体方案，再动手实现，避免把一个还没想清楚的设计直接写成代码。这个 Phase 比前几个 Phase 多了一层此前没有的风险：一旦自动填表把"工作授权""EEO 自报"这类涉及法律声明性质的字段填错，后果比"抓错一个职位标题"严重得多，所以专门为此设计了独立于字段映射结果之外的第二层防御。
+
+### 实现内容
+
+- **填表决策服务** `backend/app/services/autofill.py`（新增）：`build_autofill_plan(db, fields, light_client, jd_id)` 是整个 Phase 4 的决策核心，输入插件扫描到的一批表单字段（标签、控件类型、可选项），输出每个字段该填什么、要不要填。字段标签到画像字段的映射先走关键词直接匹配（覆盖姓名/邮箱/电话/领英/GitHub/学校/现居地等最常见字段，不消耗模型调用），匹配不上的标签批量丢给轻量模型做一次映射（同一批未命中字段合并成一次 `complete_json` 调用，沿用 Phase 2 起的批量调用惯例）。**合规安全限制**：选择类控件（select/radio/checkbox）只允许 `current_location`/`target_location` 两个客观字段通过白名单自动选择，同时叠加一层独立于字段映射结果的标签关键词兜底扫描（`_looks_like_compliance_label`，覆盖工作授权/签证/EEO/背景调查等中英文关键词），命中即强制跳过，两层防御任一触发就跳过，不依赖 LLM 输出是否"恰好没出错"。纯文本框转述用户自己的 `work_authorization` 画像字段不受这条限制。找不到画像字段映射、又被判断为主观问答题的字段，调用 `qa_bank_service.find_similar_answer` 检索题库。
+- **题库本地相似度检索** `backend/app/services/qa_similarity.py`（新增）：字符 2/3-gram 特征哈希方案，用 `zlib.crc32`（标准库、跨进程确定性，区别于 Python 内置 `hash()` 的进程级随机化）把每个 n-gram 映射进一个 512 维向量的某个桶，L2 归一化后向量点积即为余弦相似度。不依赖任何模型 API，不需要新增模型配置字段，选字符 n-gram 而不是经典 TF-IDF 是因为后者的 IDF 项依赖整个语料库统计量，`qa_bank` 会随用户持续补充问答而变化，字符 n-gram 逐条独立计算不受影响。`qa_bank_service.py` 相应扩展：`add_qa_entry` 写入/更新时顺带计算并落库 embedding，新增 `backfill_qa_embeddings` 给 Phase 2 时代写入的历史空 embedding 记录补算，新增 `find_similar_answer(db, question_text)` 供自动填表调用，相似度低于经验阈值 0.3 时返回"没找到"而不是勉强凑一个不相关的答案。
+- **插件专用接口新增四个**（`backend/app/api/routes_extension.py`）：`POST /api/autofill/plan`（调用 `build_autofill_plan`，`light_client` 允许未配置，未配置时只有关键词能命中的字段生效，不因为模型没配就整个功能不可用）、`POST /api/autofill/qa-save`（用户手打完一道题库里没有的问答题后回存，`source=application` 区别于建画像阶段的 `onboarding`）、`GET /api/autofill/resume-pdf/{jd_id}`（取这条 JD 最近一次生成的简历 PDF，供插件注入到 ATS 的简历上传控件）、`POST /api/jobs/{jd_id}/mark-applied`（投递页面提交按钮点击后推进状态）。
+- **Dashboard 新增"去投递"/"手动标记为已投递"按钮**（`backend/app/templates/job_detail.html`）：点击"去投递"在新标签页打开 `jd.source_url`，同时用一个 `window.dispatchEvent` 的自定义事件通知 `dashboard_bridge.js` 这个内容脚本把"目标网站 hostname → 这条 JD 的 id"关系存进 `chrome.storage.local`（`background/service_worker.js` 新增 `rememberPendingApplication`/`lookupPendingApplication`，按 hostname 存、30 分钟过期）；"手动标记为已投递"是本次开发过程中发现的一个缺口补的兜底按钮，见下面"遇到的问题与解决"。
+- **插件侧 ATS 平台识别与表单扫描**：`extension/content_scripts/form_scanner.js`（新增，通用表单扫描，标签解析优先级链路"`label[for]` → 包裹的 `<label>` → `aria-labelledby` → `aria-label` → `placeholder`"，都找不到就把这个字段排除在结果之外；扫描时给每个字段元素打上 `data-jobpilot-field-id` 属性，供之后回填阶段精确定位回同一个 DOM 元素）、`extension/content_scripts/ats_selectors.js`（新增，`detectAtsPlatform` 按 URL hostname 识别 Workday/Greenhouse/Lever，不可用时退化为扫描 DOM 特征；Workday 用 `data-automation-id` 优先当 field_id，Lever 用 `.application-label` 覆盖标签解析，Greenhouse 通用逻辑已够用）、`extension/content_scripts/ats_autofill.js`（新增，浏览器胶水代码：编排"扫描 → 发给本地 App 算计划 → 用原生 value setter 写回 DOM 并派发 input/change 事件让 React 类框架感知"，题库回存的 blur 提示，简历 PDF 的 `DataTransfer` 注入，提交按钮点击的捕获阶段监听）、`extension/content_scripts/dashboard_bridge.js`（新增，Dashboard 页面到插件存储的桥接）。`manifest.json` 新增 Workday/Greenhouse/Lever 三个 `host_permissions` 和两个 `content_scripts` 条目（ATS 页面一组、Dashboard 桥接一组）。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **决策逻辑和 DOM 操作严格分层，延续 Phase 3 的原则**：`autofill.py` 只产出"这个字段该填什么"的结论，`ats_autofill.js` 只负责忠实执行，不在浏览器胶水代码里掺杂任何判断——这样合规安全限制只需要在一个地方维护和测试（`test_autofill.py`），不用担心插件侧会不会"自己多做了什么"。
+2. **合规安全限制做两层独立防御，而不是只信任字段映射结果**：字段级白名单（只有 `current_location`/`target_location` 允许通过选择类控件自动选择）和标签关键词兜底扫描是完全独立的两条判断路径，任一触发都跳过。这是本项目一贯的"不让 AI 静默替用户做出有后果的决定"原则在这个 Phase 的具体体现——宁可多跳过几个本来可能安全的字段，也不能让一次模型判断失误变成一次错误的法律选择。
+3. **题库相似度命中后直接回填原文，不再额外调用模型微调措辞**：v1 最初设想里有"轻量模型微调措辞"这一步，落地时去掉了——微调本身有把用户已经确认过的原意改走样的风险，而且省一次模型调用。
+4. **ATS 选择器规则库明确是最佳努力，不是精确复刻**：云端开发环境没有真实 Workday/Greenhouse/Lever 账号，规则基于三家平台公开可观察、文档化程度较高的约定（Workday 的 `data-automation-id` 测试钩子、Lever 的 `.application-label` 写法）构造，jsdom 测试验证的是"规则本身的逻辑是对的"，不是"真实线上页面长这样"。这和 Phase 3 对待 LinkedIn 选择器的态度一致，验收清单里专门列了需要用户在真实页面上核对的部分。
+5. **提交按钮点击只是"尽力而为"的信号，不代表投递真的成功**：没有办法可靠判断 ATS 后端是否真的接受了这次提交，这里只是捕获阶段监听一次点击动作，用户完全可以在没有点提交按钮的情况下自己把状态改成已投递（新增的手动按钮），也可以在插件误判的情况下自己纠正。
+
+### 遇到的问题与解决
+
+**问题一：`build_autofill_plan` 里用 `list.index()` 反查未命中字段的下标，在两个字段标签完全相同时会串位**
+
+现象：写第一版实现时，未命中关键词匹配的字段先收集进一个 `unresolved` 列表统一批量调用 LLM，映射结果按下标对应回原字段时用了 `unresolved.index(sf)`。`ScannedField` 是一个字段值比较相等的 dataclass（没有显式关掉 `eq`），如果两个字段的标签、控件类型、options 恰好完全相同、只有 `field_id` 不同（测试里故意构造了这种情况来验证），`list.index()` 会返回第一个匹配项的下标，导致后一个字段被错误地映射成前一个字段的结果。
+
+原因：`list.index()` 是按值比较查找，不是按对象身份查找，而 dataclass 默认按字段值实现 `__eq__`，这个坑不写专门的回归测试很容易被漏过。
+
+解决：改成扫描阶段就显式建一份 `field_id -> 下标` 的映射（`unresolved_index_by_field_id`），后续查下标全部走这份映射，不再依赖 `list.index()`。补了一条专门的回归测试 `test_duplicate_labels_with_different_field_ids_resolved_independently`，故意构造两个标签完全相同的字段验证不会串位。
+
+**问题二：`_selectOptions` 过滤下拉框占位选项时，只过滤了空文本，没过滤空 value**
+
+现象：`select` 控件的占位提示项（比如 `<option value="">请选择</option>`）文本不为空（"请选择"这几个字是有内容的），第一版 `_selectOptions` 只按"文本是否为空"过滤，这个占位项就混进了返回的 options 列表里，写单元测试断言 options 列表精确匹配时立刻暴露出来。
+
+解决：改成同时要求 `value !== ""`——几乎所有下拉框的约定都是用空 value 表示"还没选"，这类选项本身不是一个真实可选的答案。
+
+**问题三：`form_scanner.js` 里用 `CSS.escape` 拼接属性选择器，在 Node/jsdom 测试环境下直接抛 `ReferenceError`**
+
+现象：第一版实现里用 `` `label[for="${CSS.escape(el.id)}"]` `` 转义属性选择器里的特殊字符，这段代码本身在真实 Chrome 里没问题（`CSS` 是浏览器全局对象），但用 jsdom 在纯 Node 环境跑单元测试时，`CSS` 这个全局根本不存在，一执行到这行就抛 `ReferenceError: CSS is not defined`，所有测试直接报错退出，不是断言失败而是脚本崩溃。
+
+原因：`CSS.escape` 是浏览器提供的全局，jsdom 模拟的是 DOM API 而不是完整的浏览器全局环境，`window.CSS` 不会自动出现在 Node 的全局作用域里（也没有在测试里显式引入 `jsdom.window` 的属性）。
+
+解决：写一个不依赖浏览器全局的最小转义函数 `_escapeAttrValue`（只转义属性选择器里真正需要转义的引号和反斜杠），替换掉所有 `CSS.escape` 调用。`ats_autofill.js`（只在真实 Chrome 里运行，不会被 Node 测试 `require`）里保留了 `CSS.escape` 的用法，两处场景不同，不需要统一处理方式。
+
+**问题四：写实施方案文档时，风险小节里声称"插件没识别到提交按钮时用户仍可以在 Dashboard 手动改状态"，但这个手动入口当时并不存在**
+
+现象：写第九节风险小节草稿时，顺手写了一句"用户仍然可以在 Dashboard 手动把状态改成已投递"作为"提交按钮识别可能失效"这条风险的兜底说明，写完之后去 `routes_dashboard.py`/`job_detail.html` 核对，发现 Dashboard 上从来没有过这样一个手动改状态的入口——`JDStatus.APPLIED` 只在状态徽章的展示文案映射里出现过，没有任何路由或按钮能把状态真的改成它。
+
+原因：写文档时凭"这种基础功能应该有"的直觉下笔，没有先去代码里确认。
+
+解决：没有把这句话改成更谨慎的措辞回避问题，而是直接把这个真实存在的功能缺口补上——新增 `POST /dashboard/jobs/{jd_id}/mark-applied` 路由和 Dashboard 详情页的"手动标记为已投递"按钮（`test_dashboard.py` 新增 2 条用例），再回头确认文档里这句话是真的。这个坑提醒自己：写文档里任何一句"用户仍然可以……"这类兜底说明之前，先去代码里确认这条退路真的存在，不能凭直觉假设。
+
+### 验证结果
+
+- 后端新增/扩展 5 个 pytest 文件：`test_qa_similarity.py`（新增，8 条）、`test_qa_bank_service.py`（新增 8 条：embedding 落库、历史数据回填、相似度检索的命中/未命中/空题库/空问题各种场景）、`test_autofill.py`（新增，15 条，重点覆盖合规安全限制的多种触发路径、LLM 失败降级、批量调用去重）、`test_routes_extension.py`（新增 10 条：四个新接口的鉴权、正常路径、边界情况，含"LLM 已配置但仍然跳过合规字段"这条关键安全回归）、`test_dashboard.py`（新增 2 条：手动标记已投递）,加上此前 Phase 0-3 遗留的用例，`backend` 目录下共 **201 条 pytest 用例全部通过**，零回归。
+- 插件侧新增 `extension/content_scripts/form_scanner.test.js`（16 条）、`extension/content_scripts/ats_selectors.test.js`（9 条），连同 Phase 3 遗留的 `linkedin_parser.test.js`（5 条），`npm test` 共 **30 条用例全部通过**；`ats_autofill.js`/`dashboard_bridge.js` 是纯浏览器胶水代码（DOM 操作、`chrome.*` 消息通信），和 Phase 3 的 `linkedin.js` 一样无法用 jsdom 做有意义的单元测试，依赖 README 的手动验收清单。
+- `extension/scripts/check_permissions.js` 复跑确认通过（新增了 `data-automation-id` 相关 DOM 查询、`DataTransfer`/`File` 等 Web API，都不需要在 `permissions` 里额外声明；`chrome.storage`/`chrome.runtime`/`chrome.tabs` 三个命名空间已经在 Phase 0/3 声明过）。
+- 先在云端沙盒环境跑通全部后端 pytest 和插件侧 Node 测试，再把改动同步到用户本机项目目录（`C:\liuzhibin\aI-agent\jobpilot`），逐文件 SHA-256 校验和确认同步无损坏，在设备侧独立 Linux 虚拟环境（`~/jobpilot_venv`）里重新跑一遍全部 pytest 用例，结果一致。真实 Chrome 加载插件、在真实 Workday/Greenhouse/Lever 投递页面上验证自动填表、简历 PDF 附件注入、提交按钮识别这几部分，云端沙盒没有图形界面也没有真实账号，无法代为完成，验收清单写在 `README.md` 新增章节，需要用户在自己电脑上手动过一遍。
+
+### 涉及文件
+
+`docs/JobPilot_实施方案.md`（v5，5.4 节改写为落地后的实际设计、第八节 Phase 4 标记完成、第六节新增三条决策记录、第九节补充 Phase 4 风险点）、`README.md`（新增章节：自动化填表的测试方式和手动验收清单）、`backend/app/services/autofill.py`（新增）、`backend/app/services/qa_similarity.py`（新增）、`backend/app/services/qa_bank_service.py`、`backend/app/api/routes_extension.py`、`backend/app/api/routes_dashboard.py`（新增手动标记已投递路由）、`backend/app/templates/job_detail.html`、`backend/tests/test_autofill.py`（新增）、`backend/tests/test_qa_similarity.py`（新增）、`backend/tests/test_qa_bank_service.py`、`backend/tests/test_routes_extension.py`、`backend/tests/test_dashboard.py`、`extension/manifest.json`（新增 ATS 三家 `host_permissions` + 两组 `content_scripts`）、`extension/content_scripts/form_scanner.js`（新增）、`extension/content_scripts/ats_selectors.js`（新增）、`extension/content_scripts/ats_autofill.js`（新增）、`extension/content_scripts/dashboard_bridge.js`（新增）、`extension/content_scripts/form_scanner.test.js`（新增）、`extension/content_scripts/ats_selectors.test.js`（新增）、`extension/background/service_worker.js`、`extension/package.json`
+
+---

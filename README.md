@@ -15,8 +15,8 @@ jobpilot/
 │   ├── alembic/                  # 数据库迁移脚本
 │   └── tests/                    # pytest 自动化测试
 └── extension/                    # Chrome 插件（Manifest V3）
-    ├── background/                # service worker：连接状态机、心跳、转发插件抓取到的 JD 给本地 App
-    ├── content_scripts/           # 注入到 LinkedIn 职位页的抓取脚本（Phase 3）+ 对应的 jsdom 回归测试
+    ├── background/                # service worker：连接状态机、心跳、转发插件抓取到的 JD 给本地 App、自动化填表相关的网络调用
+    ├── content_scripts/           # 注入到 LinkedIn 职位页（Phase 3）和 Workday/Greenhouse/Lever 投递页（Phase 4）的脚本 + 对应的 jsdom 回归测试
     └── sidepanel/                 # 侧边栏 UI：配对、状态展示
 ```
 
@@ -107,6 +107,44 @@ npm test          # 等价于 node content_scripts/linkedin_parser.test.js
 - [ ] 打开一个明显不是职位详情页的 LinkedIn 页面（比如个人主页），确认按钮没有出现（`content_scripts` 的 `matches` 规则只匹配 `linkedin.com/jobs/*`）。
 
 以上全部打勾即代表 Phase 3 验收通过。
+
+## 六、自动化填表（Phase 4）
+
+在已知的三家投递系统（Workday、Greenhouse、Lever）的投递页面上，插件会在页面右下角注入两个悬浮按钮："JobPilot 自动填表"和"附加简历 PDF"。点"自动填表"会扫描当前页面的表单字段，发给本地 App 算出每个字段该填什么，再把结果写回页面；点"附加简历 PDF"会把这条 JD 最近一次生成的简历 PDF 自动放进简历上传控件。另外，Dashboard 的 JD 详情页新增了"去投递"按钮：点击会在新标签页打开投递链接，同时让插件记住"接下来这个标签页对应这条 JD"，之后在投递页面上点击提交按钮，只要还是这个标签页，就会自动把这条 JD 的状态推进成"已投递"；如果你不是从这个按钮点过去（比如自己手动打开的投递页），插件不会做任何自动状态更新，你可以用详情页上的"手动标记为已投递"按钮自己同步状态。
+
+**合规安全说明**：工作授权、签证担保、EEO 自报（性别/种族/退伍军人身份/残障状态）、犯罪记录/背景调查这类涉及法律声明性质的字段，插件不会自动帮你选（select/radio/checkbox 这类控件），需要你自己手动选择——这是有意为之的限制，不是 bug，详见 `docs/JobPilot_实施方案.md` 5.4 节的说明。
+
+### 不需要 Chrome 的回归测试
+
+和 Phase 3 的 LinkedIn 抓取一样，表单扫描和 ATS 平台识别的核心逻辑抽成了不依赖浏览器的纯函数，用 jsdom 做单元测试：
+
+```bash
+cd jobpilot/extension
+npm install       # 第一次跑之前装一下开发依赖
+npm test          # 依次跑 linkedin_parser / form_scanner / ats_selectors 三组测试
+```
+
+正常应该看到三组测试全部通过（`form_scanner.test.js` 16 条，覆盖各种标签关联方式和 select/radio/checkbox 字段提取；`ats_selectors.test.js` 9 条，覆盖平台识别和 Workday/Greenhouse/Lever 各自的标签解析规则）。后端的填表决策逻辑（`build_autofill_plan`）和合规安全限制在 `backend/tests/test_autofill.py` 里用 pytest 覆盖，随 `python -m pytest` 一起跑。
+
+`ats_autofill.js`（悬浮按钮、DOM 填值、简历 PDF 注入、提交按钮监听）和 `dashboard_bridge.js`（"去投递"关联桥接）是纯浏览器胶水代码，依赖真实 DOM 事件和 `chrome.*` 消息通信，和 Phase 3 的 `linkedin.js` 一样无法用 jsdom 做有意义的单元测试，需要下面的手动验收。
+
+如果哪天发现某个 ATS 平台上抓不到某个字段的标签、或者字段类型判断错了，优先的排查方式和 LinkedIn 抓取一样：把当时页面对应部分的 HTML 结构记录下来，在 `form_scanner.test.js` 或 `ats_selectors.test.js` 里加一条新用例复现问题，再去 `form_scanner.js`/`ats_selectors.js` 里补一条新的选择器/标签解析分支。
+
+### 需要在真实 Chrome + 真实 ATS 页面上手动验收的部分
+
+云端环境没有图形界面、也没有 Workday/Greenhouse/Lever 的真实测试账号，规则库是基于三家平台公开可观察到的约定构造的最佳努力实现，下面这些必须你在自己电脑上手动确认：
+
+- [ ] 按上面"四、加载 Chrome 插件"重新加载一次插件（`manifest.json` 新增了 ATS 三家的 `host_permissions` 和 `content_scripts`，必须整个重新加载才会生效）。
+- [ ] 找一个真实的 Workday/Greenhouse/Lever 投递页面打开，页面右下角应该能看到"JobPilot 自动填表"和"附加简历 PDF"两个悬浮按钮。
+- [ ] 先在画像页面填好姓名/邮箱/电话/领英链接等基本信息，点击"JobPilot 自动填表"，按钮文案应该依次变化"扫描中…" → "计算填表方案中…" → "已填 N 个字段"，对应的输入框应该被正确填上；如果页面是 React/Vue 这类框架驱动的，确认填进去的值真的被框架感知到了（比如触发了页面自己的实时校验提示消失），而不是看起来填上了、提交时却读到空值。
+- [ ] 找一个涉及"工作授权"/"是否需要担保"这类问题的单选/下拉字段，确认插件没有自动帮你选，需要你自己手动选择。
+- [ ] 找一道需要主观作答的问答题（比如"为什么想加入我们"），如果题库里已经有相似的问题，确认能被自动填上；如果没有，自己写完答案后失去焦点，应该弹出"要不要存进题库"的确认框，确认后下次遇到类似问题能被检索到。
+- [ ] 在 JD 已经生成过简历的情况下，点击"附加简历 PDF"，确认简历上传控件里出现了对应的 PDF 文件。
+- [ ] 从 Dashboard JD 详情页点击"去投递"打开投递页，完成表单（不需要真的投递成功，找到提交按钮点一下即可，如果会触发真实投递请谨慎，可以用一个不重要的测试职位或者提交前及时关闭标签页），确认 Dashboard 对应 JD 的状态变成了"已投递"。
+- [ ] 不通过"去投递"按钮、自己直接打开一个投递页面，点击提交按钮，确认没有任何 JD 状态被意外更新（验证"没有关联记录就完全不做任何事"这条设计）。
+- [ ] 在 JD 详情页，点击"手动标记为已投递"，确认状态立刻变成"已投递"，按钮本身也随之消失。
+
+以上全部打勾即代表 Phase 4 验收通过。
 
 ## 安全说明
 
