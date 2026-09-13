@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # chrome-extension:// 开头就放行"（生产阶段建议锁定成具体的插件 id）。
     allowed_origin: str | None = None
 
+    # 是否跳过"启动时自动安装 PDF 渲染依赖（Windows 上的 GTK3 Runtime）"这个
+    # 动作，对应环境变量 JOBPILOT_SKIP_PDF_AUTO_INSTALL。正常使用时必须是
+    # False（这正是这个开关存在的意义：自动装好依赖，而不是报错完事）；
+    # 测试套件里会显式打开它（见 tests/conftest.py），因为自动安装涉及真实
+    # 的网络请求和执行外部安装程序，绝不能在跑 pytest 的时候被意外触发。
+    skip_pdf_auto_install: bool = False
+
     @property
     def db_path(self) -> Path:
         return self.home / "jobpilot.sqlite3"

@@ -19,6 +19,9 @@ from app.core.migrate import run_migrations
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("JOBPILOT_HOME", str(tmp_path / "jobpilot_home"))
+    # 自动安装 PDF 渲染依赖（GTK3 Runtime）涉及真实网络请求和执行外部安装
+    # 程序，测试环境必须始终关掉，只允许探测逻辑跑，不允许真的触发安装。
+    monkeypatch.setenv("JOBPILOT_SKIP_PDF_AUTO_INSTALL", "1")
     get_settings.cache_clear()
     reset_engine_cache()
     yield

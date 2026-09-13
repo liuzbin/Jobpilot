@@ -76,10 +76,12 @@ def render_resume_html(resume_json: dict, style_id: str = "default") -> str:
 def render_resume_pdf_bytes(resume_json: dict, style_id: str = "default") -> bytes:
     if _WeasyPrintHTML is None:
         raise PdfRenderingUnavailableError(
-            "PDF 渲染依赖未就绪：WeasyPrint 需要系统级的 Pango/GObject 库，"
-            "Windows 上通常需要单独安装 GTK3 运行时"
-            "（参考 https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows），"
-            "装好之后重启本地 App 即可，不影响简历的 Markdown/结构化数据内容。"
+            "PDF 渲染依赖未就绪：WeasyPrint 需要系统级的 Pango/GObject 库。"
+            "Windows 上本地 App 启动时会自动检测并尝试静默安装 GTK3 Runtime"
+            "（详见启动日志里"
+            "\"PDF 渲染依赖检查：...\"这一行）——如果日志说已经自动装好了，"
+            "重启一次本地 App 即可；如果日志说自动安装失败了，可以按日志里给的"
+            "链接手动安装。不影响简历的 Markdown/结构化数据内容。"
             f" 原始错误：{_WEASYPRINT_IMPORT_ERROR}"
         )
     html_text = render_resume_html(resume_json, style_id)

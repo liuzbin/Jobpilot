@@ -366,3 +366,54 @@
 `docs/JobPilot_实施方案.md`（v5，5.4 节改写为落地后的实际设计、第八节 Phase 4 标记完成、第六节新增三条决策记录、第九节补充 Phase 4 风险点）、`README.md`（新增章节：自动化填表的测试方式和手动验收清单）、`backend/app/services/autofill.py`（新增）、`backend/app/services/qa_similarity.py`（新增）、`backend/app/services/qa_bank_service.py`、`backend/app/api/routes_extension.py`、`backend/app/api/routes_dashboard.py`（新增手动标记已投递路由）、`backend/app/templates/job_detail.html`、`backend/tests/test_autofill.py`（新增）、`backend/tests/test_qa_similarity.py`（新增）、`backend/tests/test_qa_bank_service.py`、`backend/tests/test_routes_extension.py`、`backend/tests/test_dashboard.py`、`extension/manifest.json`（新增 ATS 三家 `host_permissions` + 两组 `content_scripts`）、`extension/content_scripts/form_scanner.js`（新增）、`extension/content_scripts/ats_selectors.js`（新增）、`extension/content_scripts/ats_autofill.js`（新增）、`extension/content_scripts/dashboard_bridge.js`（新增）、`extension/content_scripts/form_scanner.test.js`（新增）、`extension/content_scripts/ats_selectors.test.js`（新增）、`extension/background/service_worker.js`、`extension/package.json`
 
 ---
+
+## Phase 4 补充：Windows 上 PDF 渲染依赖从"报错崩溃"到"自动安装"（2026-09-12）
+
+### 目标
+
+用户在自己的 Windows 机器上第一次本地体验时，`python -m app.main` 直接崩溃退出：`OSError: cannot load library 'libgobject-2.0-0'`。根因是 `resume_pdf.py` 在模块顶层 `from weasyprint import HTML`，而 WeasyPrint 是通过 cffi 调用系统级 Pango/GObject C 库的，`pip install weasyprint` 只装了 Python 这一层，Windows 上还需要单独装一份 GTK3 运行时——这个模块又被 `resume_tailor.py -> routes_dashboard.py -> app.main` 在顶层逐级 import，导致一个跟"能不能生成 PDF"这个可选产物完全无关的系统依赖缺失,直接拖垮了整个本地 App，画像、JD 打分、抓取、题库这些功能全都用不了。
+
+这个 Phase 补充分两步走，对应用户两轮反馈：第一轮先把"崩溃"变成"运行时才检查、给一个信息明确的错误提示"（防止一个可选依赖缺失拖垮整个 App）；用户看到这个方案后明确反馈这仍然是"挖了个坑"——**如果这个依赖是必须的，就应该放进自动化流程里去装，而不是提示用户手动安装、或者不装就报错**。第二步才是这里要记录的重点：把 GTK3 Runtime 的安装本身也自动化。
+
+### 实现内容
+
+- **防御性/延迟 import**（`backend/app/services/resume_pdf.py`）：模块顶层的 `import weasyprint` 包一层 `try/except`，导入失败只记录"这次不可用"和原始异常，不让异常向上传播；真正调用 `render_resume_pdf_bytes` 时才检查，不可用就抛信息明确的 `PdfRenderingUnavailableError`，而不是一个不知所云的 `OSError`。`resume_tailor.confirm_and_finalize` 早就把 `save_resume_pdf` 包在 try/except 里，PDF 生成失败只是不写 `pdf_path`，不影响简历确认这个操作本身。
+- **自动安装 GTK3 Runtime**（`backend/app/services/pdf_dependency_installer.py`，新增）：本地 App 每次启动时（`app/main.py` 的 `lifespan`）检查一次，`_WeasyPrintHTML is None` 且是 Windows 才会触发：先用 `ctypes.WinDLL("libgobject-2.0-0.dll")` 轻量探测（不直接 `import weasyprint`，避免它自己失败时往 stderr 打一大段排障文字），缺失就调用 GitHub API（`tschoonj/GTK-for-Windows-Runtime-Environment-Installer` 的 `releases/latest`）拿到最新安装包地址，下载后用 NSIS 的 `/S` 参数静默安装，不需要用户任何交互。安装失败（下载失败、安装程序超时、退出码非 0）会捕获成 `GtkAutoInstallError`，记日志 + 给一条带手动安装链接的提示，不会拖垮启动流程；连续失败时会在本地记一个时间戳，一小时内不重复尝试（避免网络有问题时每次启动都多等一次下载超时）。
+- **`app/main.py` 接线**：新增 `_check_pdf_dependency`，在 `lifespan` 里、写完启动日志之后调用，把探测/安装结果落一行 `PDF 渲染依赖检查：...` 日志。新增 `Settings.skip_pdf_auto_install`（环境变量 `JOBPILOT_SKIP_PDF_AUTO_INSTALL`），`tests/conftest.py` 的 `isolated_home` fixture 里强制打开，保证 pytest 跑测试时绝不会意外触发真实的网络下载和外部安装程序执行。
+- **面向用户的提示文案更新**：`resume_pdf.py` 里 `PdfRenderingUnavailableError` 的错误信息、`resume_result.html` 里 PDF 没生成成功时的提示，都改成指向启动日志里的"PDF 渲染依赖检查"这一行，而不是让用户自己去查 WeasyPrint 官方文档。`README.md` "一、启动本地 App" 章节新增一段，解释这行日志的几种可能内容分别该怎么处理。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **只自动装 Windows 的 GTK3 Runtime，不管 Linux/macOS 缺的系统库**：Linux 的 `libpango` 之类只能走 `apt`，macOS 走 `brew`，这两者都需要 sudo/管理员交互、会改动系统级包管理器状态，不适合程序自己静默执行；而这两个平台的开发者本来也更容易自己用包管理器解决。Windows 的 GTK3 Runtime 恰好相反：有官方独立安装包、支持真正静默的 `/S` 参数、装到默认路径后 WeasyPrint 自己的 `ffi.py` 会自动发现，不需要改 PATH——这是唯一能在不需要用户交互、不需要 sudo 密码的前提下做到"真自动安装"的场景，也刚好是本项目实际踩到的那个 bug。
+2. **自动装完之后，诚实地告诉用户"需要重启一次"，不假装当次就能用**：WeasyPrint 探测 DLL 目录的逻辑（`os.add_dll_directory`）只在"进程刚启动、还没 import 任何东西"的那一刻跑一次，当前这个已经在运行中的进程即使装好了 GTK3，大概率也看不到——这是 WeasyPrint 自己的实现方式决定的限制，不是这个自动化流程能绕开的，所以选择诚实反映（"已自动安装完成，请重启一次本地 App"）而不是误报成功或者误报失败。
+3. **失败退避用本地时间戳文件，不用更复杂的机制**：一小时的固定退避足够避免"网络有问题时每次启动都多等一次超时"这个新问题，不需要指数退避之类更复杂的策略——这本来就是个低频场景（一台机器基本只会真正缺这个依赖一次）。
+
+### 遇到的问题与解决
+
+**问题一：`pytest.raises(PdfRenderingUnavailableError)` 抓不住 `importlib.reload` 之后模块自己抛出的异常实例**
+
+现象：为了验证"这个模块被 import 的那一刻 `import weasyprint` 本身就抛异常"这个最贴近真实故障的场景，测试里用 `sys.modules['weasyprint'] = None` 强制下一次 import 失败、再 `importlib.reload(resume_pdf)`，断言重新加载之后调用 `render_resume_pdf_bytes` 会抛 `PdfRenderingUnavailableError`——但用文件顶部 reload 之前 `import` 进来的那个类引用去 `pytest.raises`，死活抓不住。
+
+原因：`importlib.reload` 会重新执行整个模块的类定义，产生一个新的类对象，和 reload 之前导入进来的旧类对象不是同一个身份，`pytest.raises(旧引用)` 做的是 `isinstance` 检查，抓不住新类的实例。
+
+解决：改用 `reloaded.PdfRenderingUnavailableError`（重新加载之后模块自己的类属性）而不是模块级别导入的旧引用。
+
+**问题二：第一版"自动安装成功之后"的分支设计，把"这次探测还是失败"直接判定成安装失败**
+
+现象：写完第一版 `ensure_pdf_dependency` 后自己测试时发现，`auto_install_gtk_runtime()` 没抛异常（意味着静默安装程序退出码是 0，系统层面已经装好了）之后，紧接着再探测一次 `probe_gtk_available()`，这次探测按前面"问题设计取舍 2"里说的原因大概率还是会返回 `False`——第一版代码把这种情况报成"安装程序已执行，但探测仍未通过"这样一句偏警告性质的话，读起来像是安装失败了，但实际上只是当前进程看不到而已，装到位这件事本身是成功的。
+
+解决：把"探测是否立刻通过"和"安装本身是否成功"这两件事在代码里彻底分开——只要 `auto_install_gtk_runtime()` 没抛异常就记成功状态（不会触发失败退避），探测立刻通过就是"当次即可用"，探测没通过就明确说"已自动安装完成，请重启一次"，不再有一个"看起来像失败但其实是成功"的中间状态。写单测的时候把这条分支单独测出来（`test_ensure_pdf_dependency_success_reports_restart_needed`）才发现最初的用例断言本身就是照着"应该输出什么样的最终文案"这个错误假设写的,倒逼着回头改了代码逻辑而不是改测试断言去迁就它。
+
+### 验证结果
+
+- `backend/tests/test_pdf_dependency_installer.py`（新增，15 条）：覆盖平台判断、探测函数、`ensure_pdf_dependency` 的每一条状态机分支（已就绪 / 未启用自动安装 / 退避期内跳过重试 / 退避期过后重新尝试 / 自动安装成功且当次可用 / 自动安装成功但需要重启 / 自动安装失败）、GitHub release 资产解析、静默安装子进程调用的正常/超时/非零退出码路径——全部通过 monkeypatch 掉真实的网络请求和 `subprocess.run`，不会真的联网或者执行任何安装程序。
+- `backend/tests/test_main_startup.py`（新增，3 条）：验证 `app/main.py` 新增的 `_check_pdf_dependency` 在 WeasyPrint 已可用时完全不触碰安装模块、在不可用时正确地把 `settings.skip_pdf_auto_install` 取反传给 `auto_install` 参数，以及完整走一遍 `TestClient` 生命周期确认不会意外触发真实安装逻辑。
+- `backend/tests/test_resume_pdf.py`、`backend/tests/test_resume_tailor.py` 里此前为防御性 import 补的回归测试保持不变、全部通过。
+- 全量跑 `backend` 目录下 pytest，**223 条用例全部通过**，零回归。
+- 真实的"Windows 机器上从零开始、确实缺 GTK3、自动下载安装、重启一次之后 PDF 真的能生成"这条完整链路，云端沙盒和设备侧的 Linux 虚拟环境都无法端到端验证（本来就只在 Windows 上发生），需要用户在自己电脑上实际走一遍：删掉之前可能手动装过的 GTK3（如果装过的话）或者直接在一台干净的 Windows 环境上验证，重点看启动日志里 `PDF 渲染依赖检查：...` 这一行的内容是否符合预期、重启一次之后简历重制流程里"生成 PDF"是否真的能成功。
+
+### 涉及文件
+
+`backend/app/services/pdf_dependency_installer.py`（新增）、`backend/app/services/resume_pdf.py`（防御性 import + 错误提示文案）、`backend/app/main.py`（新增 `_check_pdf_dependency` 并接入 `lifespan`）、`backend/app/core/config.py`（新增 `skip_pdf_auto_install` 配置项）、`backend/app/templates/resume_result.html`（PDF 未生成时的提示文案）、`backend/tests/test_pdf_dependency_installer.py`（新增）、`backend/tests/test_main_startup.py`（新增）、`backend/tests/test_resume_pdf.py`、`backend/tests/test_resume_tailor.py`、`backend/tests/conftest.py`（新增 `JOBPILOT_SKIP_PDF_AUTO_INSTALL` 环境变量隔离）、`README.md`（"一、启动本地 App" 章节新增 Windows PDF 依赖自动安装说明）
+
+---
