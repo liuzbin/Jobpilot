@@ -14,6 +14,7 @@ from urllib.parse import quote, unquote
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_local_browser
@@ -21,12 +22,14 @@ from app.api.deps_llm import get_heavy_client, get_light_client
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.llm_client import LLMClient
+from app.core.paths import app_root
 from app.core.secrets import set_secret
 from app.models.tables import (
     ExperienceEntry,
     ExperienceLevel,
     JDRecord,
     JDStatus,
+    LLMUsageLog,
     MatchScore,
     ModelConfig,
     ModelSlot,
@@ -62,15 +65,18 @@ from app.services.qa_bank_service import (
     save_qa_answers,
 )
 from app.services.resume_ingest import extract_text, structure_resume_text
+from app.services.resume_pdf import AVAILABLE_RESUME_STYLES, UnknownResumeStyleError
 from app.services.resume_tailor import (
     JDNotFoundError as TailorJDNotFoundError,
+    ResumeVersionNotFoundError,
     build_resume_draft,
     confirm_and_finalize,
+    regenerate_resume_pdf,
 )
 
 router = APIRouter(prefix="/dashboard")
 
-TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
+TEMPLATES_DIR = app_root() / "app" / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 STATUS_LABELS = {
@@ -481,6 +487,44 @@ def models_page(request: Request, db: Session = Depends(get_db)) -> HTMLResponse
     )
 
 
+@router.get("/usage", response_class=HTMLResponse)
+def usage_page(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
+    """Phase 5"用量统计面板"：按槽位汇总调用次数/成功失败次数/token 总数，
+    再列最近 50 条明细。数据来自 `app.core.llm_factory.build_client` 包的
+    `UsageTrackingLLMClient`，只要是通过真实配置调用的模型（不是测试里
+    `dependency_overrides` 直接换上去的 `FakeLLMClient`）都会被记下来。"""
+    summary = {}
+    for slot in ModelSlot:
+        total_calls = db.query(LLMUsageLog).filter(LLMUsageLog.slot == slot).count()
+        ok_calls = (
+            db.query(LLMUsageLog).filter(LLMUsageLog.slot == slot, LLMUsageLog.ok.is_(True)).count()
+        )
+        total_tokens = (
+            db.query(func.coalesce(func.sum(LLMUsageLog.total_tokens), 0))
+            .filter(LLMUsageLog.slot == slot)
+            .scalar()
+        )
+        summary[slot.value] = {
+            "total_calls": total_calls,
+            "ok_calls": ok_calls,
+            "failed_calls": total_calls - ok_calls,
+            "total_tokens": total_tokens or 0,
+        }
+    recent_logs = (
+        db.query(LLMUsageLog).order_by(LLMUsageLog.created_at.desc(), LLMUsageLog.id.desc()).limit(50).all()
+    )
+    return templates.TemplateResponse(
+        "usage.html",
+        {
+            "request": request,
+            "active": "usage",
+            "summary": summary,
+            "recent_logs": recent_logs,
+            **_flash_params(request),
+        },
+    )
+
+
 @router.post("/models/{slot}", dependencies=[Depends(require_local_browser)])
 def models_update(
     slot: str,
@@ -629,6 +673,7 @@ def job_tailor_draft(
             "hit_items": draft.hit_items,
             "suggestions": draft.suggestions,
             "hit_items_json": json.dumps(draft.hit_items, ensure_ascii=False),
+            "available_styles": AVAILABLE_RESUME_STYLES,
             **_flash_params(request),
         },
     )
@@ -662,8 +707,16 @@ async def job_tailor_confirm(jd_id: int, request: Request, db: Session = Depends
             }
         )
 
+    # 表单上的风格下拉框选项就是 AVAILABLE_RESUME_STYLES 的 key，正常操作
+    # 不可能提交出一个不在里面的值；这里兜底回退到 "default" 而不是让一个
+    # 被篡改过的表单值直接把 UnknownResumeStyleError 捅到用户面前——挑错
+    # 风格不应该让整个"生成简历"操作失败,大不了渲染出来的是默认风格。
+    style_id = form.get("style_id") or "default"
+    if style_id not in AVAILABLE_RESUME_STYLES:
+        style_id = "default"
+
     try:
-        resume_version = confirm_and_finalize(db, jd_id, k_value, hit_items, accepted_suggestions)
+        resume_version = confirm_and_finalize(db, jd_id, k_value, hit_items, accepted_suggestions, style_id)
     except TailorJDNotFoundError:
         raise HTTPException(status_code=404, detail="JD not found")
     except Exception as exc:  # noqa: BLE001
@@ -687,9 +740,29 @@ def resume_version_detail(
             "active": "jobs",
             "jd": jd,
             "resume_version": resume_version,
+            "available_styles": AVAILABLE_RESUME_STYLES,
             **_flash_params(request),
         },
     )
+
+
+@router.post("/jobs/{jd_id}/resumes/{resume_id}/regenerate-pdf", dependencies=[Depends(require_local_browser)])
+def resume_version_regenerate_pdf(
+    jd_id: int, resume_id: int, db: Session = Depends(get_db), style_id: str = Form("default")
+) -> RedirectResponse:
+    """Phase 5：简历风格自定义——不重新走 LLM 生成，只用已经存好的
+    `resume_json` 换一套风格重新渲染 PDF，方便用户在几套风格之间随便切换
+    对比效果。"""
+    result_url = f"/dashboard/jobs/{jd_id}/resumes/{resume_id}"
+    try:
+        regenerate_resume_pdf(db, resume_id, style_id)
+    except ResumeVersionNotFoundError:
+        raise HTTPException(status_code=404, detail="resume version not found")
+    except UnknownResumeStyleError as exc:
+        return _redirect_with_flash(result_url, str(exc), error=True)
+    except Exception as exc:  # noqa: BLE001 - 例如 PdfRenderingUnavailableError
+        return _redirect_with_flash(result_url, f"重新生成 PDF 失败: {exc}", error=True)
+    return _redirect_with_flash(result_url, "已按新风格重新生成 PDF")
 
 
 @router.get("/jobs/{jd_id}/resumes/{resume_id}/pdf")

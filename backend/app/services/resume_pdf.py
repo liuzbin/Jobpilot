@@ -6,8 +6,17 @@ WeasyPrint 渲染成 PDF。当前先实现一套风格模板,模板和渲染逻�
 `confirm_and_finalize` 产出的 `resume_json` 是唯一的事实来源——PDF 只是它的
 一种渲染形式，不会在渲染过程中引入任何新内容，样式模板负责的只是排版。
 `style_id` 对应 `app/templates/resume_styles/<style_id>.html` 下的一个 Jinja2
-模板文件，目前只有 "default" 一套风格，后续要加新风格只需要新增模板文件，
-不需要改这里的渲染逻辑。
+模板文件；新增一套风格只需要新增一个模板文件 + 在 `AVAILABLE_RESUME_STYLES`
+里登记一行给用户看的名字，不需要改这里的渲染逻辑——两套模板读的是完全相同
+的 `resume_json` 结构，互相切换只影响排版，不会丢失或改变任何简历内容。
+
+**Phase 5"简历风格自定义能力"**：`AVAILABLE_RESUME_STYLES` 是 Dashboard 上
+风格下拉框的唯一数据来源（`routes_dashboard.py` 渲染下拉框、校验用户提交的
+`style_id` 都读这个字典，不是各自维护一份可能会不同步的列表）。用户可以在
+"生成简历"确认页选风格，也可以在已经生成的简历结果页不重新走 LLM 生成、
+只用已经存好的 `resume_json` 换一套风格重新渲染 PDF（见
+`resume_tailor.regenerate_resume_pdf`）——这一步完全本地渲染、不消耗任何
+LLM 调用，所以"换个风格看看"可以随便试。
 
 **WeasyPrint 导入做成延迟/防御性的（Phase 4 之后补的健壮性修复）**：
 WeasyPrint 不是纯 Python 库，它通过 cffi 调用系统里的 Pango/GObject 这些
@@ -37,8 +46,9 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 
 from app.core.config import get_settings
+from app.core.paths import app_root
 
-_TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates" / "resume_styles"
+_TEMPLATES_DIR = app_root() / "app" / "templates" / "resume_styles"
 
 _env = Environment(
     loader=FileSystemLoader(str(_TEMPLATES_DIR)),
@@ -52,6 +62,16 @@ try:
 except Exception as _exc:  # noqa: BLE001 - 任何原因导致的导入失败都不应该拖垮整个 App
     _WeasyPrintHTML = None
     _WEASYPRINT_IMPORT_ERROR = _exc
+
+
+# style_id -> 给用户看的中文名。顺序就是下拉框里出现的顺序。新增风格模板
+# 之后必须同步在这里登记一行，否则用户在 Dashboard 上永远选不到它——这是
+# 有意的（不自动扫描 resume_styles/ 目录下多出来的 .html 文件当成可选项），
+# 避免"模板文件还没写完/写错了"就意外出现在用户可选列表里。
+AVAILABLE_RESUME_STYLES: dict[str, str] = {
+    "default": "默认（简洁单栏）",
+    "compact": "紧凑（更小间距，适合内容较多）",
+}
 
 
 class UnknownResumeStyleError(ValueError):

@@ -286,6 +286,28 @@ class ClaimedSkill(Base):
     experience_entry: Mapped[ExperienceEntry] = relationship(back_populates="claimed_skills")
 
 
+class LLMUsageLog(Base):
+    """Phase 5"用量统计面板"：每次调用轻量/重量模型槽位都记一条，无论成功
+    还是失败。只统计调用次数和 token 数（`prompt_tokens`/`completion_tokens`/
+    `total_tokens` 来自模型返回的 OpenAI 兼容 `usage` 字段，不是所有网关都会
+    返回，缺失时就是 NULL），不做费用估算——用户各自配置的模型服务定价不
+    统一（不同厂商、不同套餐、汇率都不一样），这不是本项目能可靠获取的信息，
+    硬凑一个金额出来只会是一种误导性的伪精确，不如老老实实只展示调用次数
+    和 token 数,让用户自己对照自己那边的账单。"""
+
+    __tablename__ = "llm_usage_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slot: Mapped[ModelSlot] = mapped_column(Enum(ModelSlot), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    ok: Mapped[bool] = mapped_column(nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class ModelConfig(Base):
     """轻量/重量两个模型槽位的配置。API Key 不落库,只存 keyring 引用名。"""
 

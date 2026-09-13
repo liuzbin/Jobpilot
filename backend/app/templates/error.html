@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}出错了 - JobPilot{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>出错了</h1>
+  <p>这是本地 App 没有预料到的一个错误，不是你操作有问题。完整的错误信息和堆栈已经记录到本地 App 的日志里（启动它的那个终端窗口能看到），方便的话可以把日志内容反馈给开发者。</p>
+  <p class="muted">错误摘要：{{ error_summary }}</p>
+  <p><a href="/dashboard/jobs">&larr; 返回投递列表</a></p>
+</div>
+{% endblock %}

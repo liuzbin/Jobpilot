@@ -444,6 +444,85 @@ def test_confirm_and_finalize_degrades_gracefully_when_pdf_rendering_unavailable
     assert resume_version.pdf_path is None
 
 
+# ---------- Phase 5：换个风格重新渲染 PDF，不重新走 LLM ----------
+
+
+def test_regenerate_resume_pdf_switches_style_without_touching_facts(db_session):
+    from pathlib import Path
+
+    from app.services.resume_tailor import regenerate_resume_pdf
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [], style_id="default")
+    assert resume_version.style_id == "default"
+    original_markdown = resume_version.markdown_text
+    original_json = resume_version.resume_json
+
+    updated = regenerate_resume_pdf(db_session, resume_version.id, "compact")
+
+    assert updated.id == resume_version.id
+    assert updated.style_id == "compact"
+    assert updated.markdown_text == original_markdown  # 事实来源完全不受影响
+    assert updated.resume_json == original_json
+    assert updated.pdf_path is not None
+    assert Path(updated.pdf_path).read_bytes()[:4] == b"%PDF"
+
+
+def test_regenerate_resume_pdf_missing_version_raises(db_session):
+    from app.services.resume_tailor import ResumeVersionNotFoundError, regenerate_resume_pdf
+
+    with pytest.raises(ResumeVersionNotFoundError):
+        regenerate_resume_pdf(db_session, 9999, "default")
+
+
+def test_regenerate_resume_pdf_unknown_style_raises_and_keeps_old_pdf(db_session):
+    from pathlib import Path
+
+    from app.services.resume_pdf import UnknownResumeStyleError
+    from app.services.resume_tailor import regenerate_resume_pdf
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [], style_id="default")
+    original_pdf_path = resume_version.pdf_path
+
+    with pytest.raises(UnknownResumeStyleError):
+        regenerate_resume_pdf(db_session, resume_version.id, "does-not-exist")
+
+    db_session.refresh(resume_version)
+    assert resume_version.style_id == "default"  # 没被改坏
+    assert resume_version.pdf_path == original_pdf_path
+    assert Path(resume_version.pdf_path).exists()  # 旧 PDF 文件也还在
+
+
+def test_regenerate_resume_pdf_propagates_failure_and_keeps_old_state(db_session, monkeypatch):
+    """换风格重新渲染失败时（比如 WeasyPrint 依赖当时不可用），不应该悄悄
+    什么都不做——这是用户主动点的一个动作,应该让调用方（Dashboard 路由）
+    感知到失败并提示用户,同时旧的 style_id/pdf_path 必须原样保留,不能被
+    半途写坏。"""
+    from app.services import resume_pdf
+    from app.services.resume_tailor import regenerate_resume_pdf
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [], style_id="default")
+    original_pdf_path = resume_version.pdf_path
+
+    monkeypatch.setattr(resume_pdf, "_WeasyPrintHTML", None)
+    monkeypatch.setattr(resume_pdf, "_WEASYPRINT_IMPORT_ERROR", ImportError("simulated missing libgobject"))
+
+    with pytest.raises(resume_pdf.PdfRenderingUnavailableError):
+        regenerate_resume_pdf(db_session, resume_version.id, "compact")
+
+    db_session.refresh(resume_version)
+    assert resume_version.style_id == "default"
+    assert resume_version.pdf_path == original_pdf_path
+
+
 # ---------- 回归测试：认领技能库不影响打分引擎 ----------
 
 

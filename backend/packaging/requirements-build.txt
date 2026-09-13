@@ -1,0 +1,5 @@
+# 打包成独立可执行文件时才需要装这个，不是本地 App 运行时依赖，所以单独放
+# 一个文件，不混进 requirements.txt——正常"跑源码"的开发者/用户完全不需要
+# 装 PyInstaller。用法见 backend/packaging/jobpilot.spec 顶部的说明和
+# README.md"打包成独立可执行文件"一节。
+pyinstaller==6.22.3

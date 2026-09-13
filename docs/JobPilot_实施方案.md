@@ -1,10 +1,10 @@
 # JobPilot 实施方案
 
-版本：v5（Phase 4 完成：自动化填表）　日期：2026-09-12　作者：liuzbin
+版本：v6（Phase 5 完成：打磨阶段，Phase 0-5 全部完成）　日期：2026-09-13　作者：liuzbin
 
 说明：本项目由 liuzbin 主导产品设计与决策，开发过程中与 AI 助手 Claude（Anthropic）协作完成方案撰写与编码实现。
 
-本方案基于产品描述以及历次讨论结果整理而成，作为分阶段编码的唯一依据。每次进入新阶段前，如发现与本方案冲突的地方，先回来更新本文档，再动代码——这是从 v1 就定下的规则。v2 是这条规则的一次实践（Phase 2 编码前先谈清楚"核心价值主张"和"画像深化"的设计）；v3 是另一次实践（Phase 2 代码落地过程中先交付主链路就报告"完成"，对照第八节清单自查后发现还有 4 项没做完，补齐后才算真正验收通过）；v4 记录 Phase 3——插件抓取 LinkedIn 职位——完成并通过验收；本版本（v5）记录 Phase 4——自动化填表——完成并通过验收，其中题库相似度检索的具体算法、提交按钮监听后是否联动状态推进这两个 v1 遗留的开放问题，在编码前先各自跟用户确认清楚才动手（详见 5.4 和第六节决策记录）。
+本方案基于产品描述以及历次讨论结果整理而成，作为分阶段编码的唯一依据。每次进入新阶段前，如发现与本方案冲突的地方，先回来更新本文档，再动代码——这是从 v1 就定下的规则。v2 是这条规则的一次实践（Phase 2 编码前先谈清楚"核心价值主张"和"画像深化"的设计）；v3 是另一次实践（Phase 2 代码落地过程中先交付主链路就报告"完成"，对照第八节清单自查后发现还有 4 项没做完，补齐后才算真正验收通过）；v4 记录 Phase 3——插件抓取 LinkedIn 职位——完成并通过验收；v5 记录 Phase 4——自动化填表——完成并通过验收，其中题库相似度检索的具体算法、提交按钮监听后是否联动状态推进这两个 v1 遗留的开放问题，在编码前先各自跟用户确认清楚才动手（详见 5.4 和第六节决策记录）；本版本（v6）记录 Phase 5——打磨阶段——完成并通过验收，是实施方案第八节最初规划的最后一个 Phase，至此 Phase 0-5 全部完成。
 
 截至本版本，Phase 0（本地 App + 插件基座）、Phase 1（端到端打分闭环）、Phase 2（画像深化与简历重制，含补完的 4 项）、Phase 3（插件抓取 LinkedIn 职位）、Phase 4（自动化填表）均已完成并通过验收，代码已提交至 GitHub（`https://github.com/liuzbin/Jobpilot.git`），每个阶段的实现过程、遇到的问题与解决方式记录在 `docs/DEVELOPMENT_LOG.md`。
 
@@ -112,7 +112,7 @@ JD 由用户手动粘贴全文，轻量模型做结构化解析，LinkedIn 附�
 
 ### 5.6 多模型编排
 
-（已在 Phase 0/1 落地，架构与 v1 一致。）两个可配置槽位——"轻量模型"和"重量模型"，各自独立配置 `base_url`、`model_name`、API Key（Key 加密存本地文件），只要目标服务提供 OpenAI 兼容的 Chat Completions 接口就可以直接接入。业务代码通过 `LLMClient` 协议统一调用，不感知具体用的是哪家模型。Phase 2 新增的追问式访谈问题生成、bullet 三元组抽取用轻量槽位（偏抽取），技能延伸建议的构造和简历重制的最终生成用重量槽位（偏语义推理）。Dashboard 用量统计面板留待 Phase 5 打磨阶段实现。
+（已在 Phase 0/1 落地，架构与 v1 一致。）两个可配置槽位——"轻量模型"和"重量模型"，各自独立配置 `base_url`、`model_name`、API Key（Key 加密存本地文件），只要目标服务提供 OpenAI 兼容的 Chat Completions 接口就可以直接接入。业务代码通过 `LLMClient` 协议统一调用，不感知具体用的是哪家模型。Phase 2 新增的追问式访谈问题生成、bullet 三元组抽取用轻量槽位（偏抽取），技能延伸建议的构造和简历重制的最终生成用重量槽位（偏语义推理）。Dashboard 用量统计面板已在 Phase 5 实现：`app/core/llm_factory.build_client` 返回的客户端外面包了一层 `UsageTrackingLLMClient`（`app/core/llm_usage.py`），每次调用无论成功失败都记一条 `llm_usage_log`，Dashboard"用量统计"页按槽位汇总调用次数和 token 数（不做费用估算，理由见 `LLMUsageLog` 表的文档字符串）。
 
 ## 六、关键设计决策记录
 
@@ -162,7 +162,7 @@ Dashboard：Jinja2 服务端渲染 + 少量原生 JS，已在 Phase 1 落地。
 
 **Phase 4 — 自动化填表（已完成，见 `docs/DEVELOPMENT_LOG.md`）**：✅ Workday/Greenhouse/Lever 平台识别 + 各自的标签解析规则、通用兜底扫描（其余未知 ATS）、字段标签到画像字段的关键词+轻量模型批量映射、合规/法律声明字段的两层防御性跳过机制、题库字符 n-gram 相似度检索与自动填充、简历 PDF 附件通过 `DataTransfer` 注入、"去投递"按钮驱动的投递页面关联机制与提交按钮点击监听、状态自动推进到"已投递"。
 
-**Phase 5 — 打磨阶段**：（与 v1 一致）简历风格自定义能力、本地 App 打包分发、用量统计面板、整体异常处理和用户提示文案完善。
+**Phase 5 — 打磨阶段（已完成，见 `docs/DEVELOPMENT_LOG.md`）**：✅ 简历风格自定义能力（新增 `compact` 风格模板，已生成的简历可以不重新走 LLM、只换风格重新渲染 PDF）；✅ 本地 App 打包分发（PyInstaller onedir 打包配置 `backend/packaging/jobpilot.spec`，配套把模板/alembic 迁移脚本这类"数据文件"的路径解析统一收敛到 `app/core/paths.py`，在云端 Linux 环境下实际构建并跑通了完整链路——启动、迁移、模板渲染、WeasyPrint 出 PDF；真正要分发的 Windows `.exe` 需要用户在自己机器上用同一份 spec 构建，PyInstaller 不能跨平台编译）；✅ 用量统计面板（新增 `llm_usage_log` 表，`UsageTrackingLLMClient` 包一层在 `build_client` 里自动记账，Dashboard 新增"用量统计"页，只统计调用次数和 token 数，不做费用估算）；✅ 整体异常处理（`app/main.py` 新增全局兜底异常处理器，接住所有路由自己 try/except 之外的意外错误，按路径区分返回友好 HTML 错误页或 `{"detail": ...}` JSON，真实异常仍然完整记录到日志）。
 
 ## 九、风险与待解决问题
 
@@ -172,6 +172,12 @@ Dashboard：Jinja2 服务端渲染 + 少量原生 JS，已在 Phase 1 落地。
 
 **Phase 4 新增风险点**：ATS 选择器规则库（Workday/Greenhouse/Lever）是基于公开可观察到的、文档化程度较高的约定构造的最佳努力实现，云端开发环境没有真实账号/真实 Chrome 无法逐一验证，同一家供应商不同客户的定制程度也可能不同，需要在真实页面上持续验证、遇到抓不到某个字段的情况就补一条新的选择器分支（README 附有手动验收清单，方式和 Phase 3 对待 LinkedIn 抓取规则一致）；题库相似度检索的经验阈值（0.3）是针对字符 n-gram 哈希方案初步校准的，题库积累的问答数量还很少，样本更充分之后可能需要回头调整这个阈值；提交按钮识别目前用一份通用的按钮文案关键词模式（"Submit"/"Apply Now"/"提交"等）加 `type="submit"` 判断，如果某家 ATS 的提交按钮完全不落在这个模式里，会导致监听不到点击、状态不会自动推进——用户仍然可以在 Dashboard 手动把状态改成"已投递"，不影响核心功能，只是少了自动化的这一步。
 
+**Phase 5 新增风险点/待验证事项**：Windows 上 GTK3 Runtime 自动安装（`app/services/pdf_dependency_installer.py`）的下载/静默安装/重启后生效这条完整链路，云端沙盒和设备侧的 Linux 虚拟环境都没法端到端验证，需要用户在真实 Windows 环境上验证；PyInstaller 打包在云端 Linux 环境下验证过完整的启动/迁移/模板渲染/PDF 生成链路，但真正要分发的 Windows `.exe` 同样需要用户在自己的 Windows 机器上实际构建一次并验证能不能双击直接跑起来；插件与本地 App 之间的 Origin 校验目前仍只锁定前缀 `chrome-extension://`、未锁死到具体插件 ID（见"安全说明"），这一项不在 Phase 5 的四个既定范围内，仍然是待办事项，建议插件正式打包发布、拿到固定 ID 之后再处理。
+
 ## 十、下一步行动
 
-Phase 4（自动化填表）已完成并通过验收：后端新增的 `app/services/autofill.py`（填表决策逻辑）、`app/services/qa_similarity.py`（字符 n-gram 相似度）连同 `POST /api/autofill/plan`、`POST /api/autofill/qa-save`、`GET /api/autofill/resume-pdf/{jd_id}`、`POST /api/jobs/{jd_id}/mark-applied` 四个新接口，以及 Dashboard 新增的"去投递"/"手动标记为已投递"按钮，全量 pytest 用例先在云端沙盒跑通；插件侧新增的 `form_scanner.js`（通用表单扫描）、`ats_selectors.js`（平台识别与标签解析规则）用 jsdom 做了单元测试，`ats_autofill.js`/`dashboard_bridge.js` 属于纯浏览器胶水代码（DOM 操作、chrome.\* 消息通信），和 Phase 3 的 `linkedin.js` 一样无法在没有真实 Chrome 的环境里做有意义的单元测试；再把全部改动同步到本机项目目录、在本机独立 Linux 执行环境里重新跑一遍全部 pytest + npm test，结果一致。真实 Chrome + 真实 Workday/Greenhouse/Lever 投递页面的手动验收清单见 `README.md` 新增章节，由用户在自己电脑上完成（云端开发环境没有真实账号，这部分规则库是最佳努力实现，需要用真实页面验证）。下一步进入 **Phase 5 — 打磨阶段**：简历风格自定义能力、本地 App 打包分发、用量统计面板、整体异常处理和用户提示文案完善。
+Phase 4（自动化填表）已完成并通过验收：后端新增的 `app/services/autofill.py`（填表决策逻辑）、`app/services/qa_similarity.py`（字符 n-gram 相似度）连同 `POST /api/autofill/plan`、`POST /api/autofill/qa-save`、`GET /api/autofill/resume-pdf/{jd_id}`、`POST /api/jobs/{jd_id}/mark-applied` 四个新接口，以及 Dashboard 新增的"去投递"/"手动标记为已投递"按钮，全量 pytest 用例先在云端沙盒跑通；插件侧新增的 `form_scanner.js`（通用表单扫描）、`ats_selectors.js`（平台识别与标签解析规则）用 jsdom 做了单元测试，`ats_autofill.js`/`dashboard_bridge.js` 属于纯浏览器胶水代码（DOM 操作、chrome.\* 消息通信），和 Phase 3 的 `linkedin.js` 一样无法在没有真实 Chrome 的环境里做有意义的单元测试；再把全部改动同步到本机项目目录、在本机独立 Linux 执行环境里重新跑一遍全部 pytest + npm test，结果一致。真实 Chrome + 真实 Workday/Greenhouse/Lever 投递页面的手动验收清单见 `README.md` 新增章节，由用户在自己电脑上完成（云端开发环境没有真实账号，这部分规则库是最佳努力实现，需要用真实页面验证）。
+
+Phase 4 完成之后，用户在自己的 Windows 机器上第一次实际启动本地 App 时遇到了 WeasyPrint 缺系统级 GTK3 Runtime 导致整个 App 崩溃退出的真实故障；分两步修复：先把这个依赖改成运行时按需检查、不再拖垮整个 App 启动，用户反馈这仍然是"挖了个坑"（不装的话还是报错，用户不知道要去装什么），于是进一步把 GTK3 Runtime 的安装本身也做成了自动化——本地 App 启动时自动探测、Windows 上缺失就自动下载并静默安装，全程不需要用户手动操作，只需要看启动日志里的一行提示决定要不要重启一次。这部分工作记在 `docs/DEVELOPMENT_LOG.md` 的"Phase 4 补充"一节。
+
+Phase 5（打磨阶段，本项目最初规划的最后一个 Phase）已完成并通过验收：简历风格自定义能力（新增 `compact` 风格模板 + 换风格不重新生成的能力）、本地 App 打包分发（PyInstaller 打包配置，云端 Linux 环境下构建并跑通了完整链路）、用量统计面板（`llm_usage_log` 表 + Dashboard 新页面）、整体异常处理（全局兜底异常处理器）；全量 pytest 用例（含新增的 40+ 条）在云端沙盒和用户设备侧的独立 Linux 环境里都跑通，具体清单见 `docs/DEVELOPMENT_LOG.md` 对应章节。至此实施方案第八节列出的 Phase 0-5 全部完成；后续如果有新需求，应该作为独立的新 Phase 另行规划，而不是无限往"Phase 5"里加东西。当前仍然开放、需要用户在真实环境里验证的事项见第九节"Phase 5 新增风险点/待验证事项"。

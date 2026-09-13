@@ -45,12 +45,16 @@ from app.models.tables import (
 )
 from app.services.jd_ingest import structure_jd_text
 from app.services.profile_service import get_or_create_profile_basic
-from app.services.resume_pdf import save_resume_pdf
+from app.services.resume_pdf import AVAILABLE_RESUME_STYLES, UnknownResumeStyleError, save_resume_pdf
 
 logger = logging.getLogger("jobpilot")
 
 
 class JDNotFoundError(RuntimeError):
+    pass
+
+
+class ResumeVersionNotFoundError(RuntimeError):
     pass
 
 
@@ -623,4 +627,38 @@ def confirm_and_finalize(
         db.rollback()
         logger.exception("简历 PDF 渲染失败（resume_version_id=%s），已跳过，Markdown/JSON 不受影响", resume_version.id)
 
+    return resume_version
+
+
+# ---------- Phase 5：简历风格自定义——换个风格重新渲染 PDF，不重新走 LLM ----------
+
+
+def regenerate_resume_pdf(db: Session, resume_version_id: int, style_id: str) -> ResumeVersion:
+    """已经生成过的简历版本，用户想换一套风格看看效果，不需要重新走一遍
+    K 值/延伸建议确认这套完整流程——`resume_json` 已经是持久化好的事实来源，
+    换风格只是用不同的 Jinja2 模板把同一份内容重新排一次版，属于纯本地
+    渲染，不消耗任何 LLM 调用，所以允许用户随便换着试。
+
+    只更新 `style_id` 和 `pdf_path`，`resume_json`/`markdown_text` 完全不动。
+
+    这里故意不像 `confirm_and_finalize` 那样自己吞掉 PDF 渲染失败的异常：
+    那边"生成简历"是一个更大的操作,PDF 只是附带产物,失败了不该拖累整个
+    确认流程;这里"换个风格重新生成 PDF"本身就是用户点的这一个动作、没有
+    更大的操作需要保护,失败了应该让调用方（Dashboard 路由）感知到并提示
+    用户,而不是静默地什么都没发生。异常在 `save_resume_pdf` 这一步抛出时,
+    下面两行赋值根本不会执行,所以旧的 `style_id`/`pdf_path` 会保持原样——
+    不会因为一次失败的"换风格"尝试,把用户已经拥有的、能正常下载的旧 PDF
+    意外弄丢。
+    """
+    resume_version = db.get(ResumeVersion, resume_version_id)
+    if resume_version is None:
+        raise ResumeVersionNotFoundError(f"resume_version id={resume_version_id} 不存在")
+    if style_id not in AVAILABLE_RESUME_STYLES:
+        raise UnknownResumeStyleError(f"未知的简历风格：{style_id}")
+
+    pdf_path = save_resume_pdf(resume_version.id, resume_version.resume_json or {}, style_id)
+    resume_version.style_id = style_id
+    resume_version.pdf_path = str(pdf_path)
+    db.commit()
+    db.refresh(resume_version)
     return resume_version

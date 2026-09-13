@@ -8,10 +8,19 @@
 <div class="card">
   <h2>Markdown 预览</h2>
   {% if resume_version.pdf_path %}
-  <p><a href="/dashboard/jobs/{{ jd.id }}/resumes/{{ resume_version.id }}/pdf">下载 PDF（{{ resume_version.style_id }} 风格）</a></p>
+  <p><a href="/dashboard/jobs/{{ jd.id }}/resumes/{{ resume_version.id }}/pdf">下载 PDF（{{ available_styles.get(resume_version.style_id, resume_version.style_id) }} 风格）</a></p>
   {% else %}
   <p class="muted">PDF 这次没有生成成功（不影响下面的内容）。常见原因是本地环境缺少 PDF 渲染依赖（WeasyPrint 需要系统级的 Pango/GObject 库）——Windows 上本地 App 启动时会自动检测并尝试静默安装 GTK3 Runtime，具体结果（已自动装好 / 需要重启一次 / 自动安装失败需要手动装）记录在本地 App 的启动日志里"PDF 渲染依赖检查：..."这一行，按日志提示处理后重新生成一次即可。</p>
   {% endif %}
+  <form method="post" action="/dashboard/jobs/{{ jd.id }}/resumes/{{ resume_version.id }}/regenerate-pdf" style="margin-top:8px;">
+    <label>换一套风格重新生成 PDF（不重新走 LLM，Markdown/结构化数据不受影响）</label>
+    <select name="style_id" style="display:inline-block; width:auto;">
+      {% for sid, label in available_styles.items() %}
+        <option value="{{ sid }}" {% if sid == resume_version.style_id %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="secondary">重新生成 PDF</button>
+  </form>
   <pre style="white-space:pre-wrap; font-family:inherit; font-size:13px;">{{ resume_version.markdown_text }}</pre>
 </div>
 

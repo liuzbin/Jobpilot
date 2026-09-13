@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
@@ -70,6 +70,15 @@ class OpenAICompatibleClient:
     model: str
     temperature: float = 0.0
     timeout_seconds: float = 60.0
+    # Phase 5"用量统计面板"：每次调用之后记一下这次响应里的 usage 字段
+    # （OpenAI 兼容格式一般是 {"prompt_tokens", "completion_tokens",
+    # "total_tokens"}，不是所有网关都会返回，没有就是 None）。特意不放进
+    # `__init__` 参数列表（`init=False`）——这是调用方法产生的结果,不是
+    # 构造这个客户端时应该由外部传入的配置项;外层的 `UsageTrackingLLMClient`
+    # （见 `app/core/llm_usage.py`）在每次调用之后读这个属性,不需要
+    # `OpenAICompatibleClient` 自己知道"该往哪个数据库表记账"这种它本不该
+    # 关心的事情。
+    last_usage: dict | None = field(default=None, init=False, repr=False)
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
         url = self.base_url.rstrip("/") + "/chat/completions"
@@ -89,6 +98,7 @@ class OpenAICompatibleClient:
             raise LLMCallError(f"调用模型接口失败: {exc}") from exc
 
         data = resp.json()
+        self.last_usage = data.get("usage") if isinstance(data, dict) else None
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as exc:

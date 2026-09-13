@@ -11,3 +11,9 @@ backend/data/
 backend/.pairing_token
 node_modules/
 .DS_Store
+
+# Phase 5 打包分发（PyInstaller）产物：本地构建生成，体积大且和构建机器
+# 强相关，不应该进版本库——分发用的可执行文件通过其他渠道给到用户，
+# 参照 backend/packaging/jobpilot.spec 在目标系统上现构建。
+backend/build/
+backend/dist/

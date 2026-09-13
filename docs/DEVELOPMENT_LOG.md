@@ -417,3 +417,57 @@
 `backend/app/services/pdf_dependency_installer.py`（新增）、`backend/app/services/resume_pdf.py`（防御性 import + 错误提示文案）、`backend/app/main.py`（新增 `_check_pdf_dependency` 并接入 `lifespan`）、`backend/app/core/config.py`（新增 `skip_pdf_auto_install` 配置项）、`backend/app/templates/resume_result.html`（PDF 未生成时的提示文案）、`backend/tests/test_pdf_dependency_installer.py`（新增）、`backend/tests/test_main_startup.py`（新增）、`backend/tests/test_resume_pdf.py`、`backend/tests/test_resume_tailor.py`、`backend/tests/conftest.py`（新增 `JOBPILOT_SKIP_PDF_AUTO_INSTALL` 环境变量隔离）、`README.md`（"一、启动本地 App" 章节新增 Windows PDF 依赖自动安装说明）
 
 ---
+
+## Phase 5：打磨阶段——简历风格自定义、本地 App 打包分发、用量统计面板、整体异常处理（2026-09-13）
+
+### 目标
+
+实施方案第八节最初规划的最后一个 Phase，四件事：①简历风格自定义能力；②本地 App 打包分发（不需要用户自己装 Python）；③用量统计面板；④整体异常处理和用户提示文案完善。这四件事彼此独立，不共享一条主链路，所以按依赖关系从底层往上做：先做②里"数据文件路径解析"这个后面几项都可能用得上的基础设施，再做①③两个纯业务功能，最后做④这道贯穿全局的安全网。
+
+### 实现内容
+
+- **① 简历风格自定义能力**：新增 `compact` 风格模板（`backend/app/templates/resume_styles/compact.html`），和已有的 `default` 读同一份 `resume_json` 结构，只是排版更紧凑。`app/services/resume_pdf.py` 新增 `AVAILABLE_RESUME_STYLES` 字典作为 Dashboard 风格下拉框的唯一数据来源。"生成简历"确认页新增风格选择，`app/services/resume_tailor.py` 新增 `regenerate_resume_pdf(db, resume_version_id, style_id)`：已经生成过的简历，不重新走 LLM，只用已经落库的 `resume_json` 换一套模板重新渲染 PDF，纯本地渲染、不消耗模型调用，Dashboard 简历结果页新增对应的"重新生成 PDF"表单和路由 `POST /dashboard/jobs/{jd_id}/resumes/{resume_id}/regenerate-pdf`。
+- **② 本地 App 打包分发**：新增 `app/core/paths.py`，把"模板目录/alembic 脚本目录在磁盘上的真实位置"这件事从此前三处分散的 `Path(__file__).resolve().parents[N]` 写法收敛成统一的 `app_root()`——未打包时行为不变，打包成 PyInstaller 可执行文件之后自动切换到 `sys._MEIPASS`（数据文件被解压/安装到的目录）。新增 `backend/packaging/jobpilot.spec`（onedir 模式：所有文件常驻在一个目录里直接运行，比 onefile 每次启动都要解压快得多，"打包后需要重启一次"这种场景——比如 GTK3 自动安装完成后——也不会因为每次都要解压而变慢）和 `backend/packaging/requirements-build.txt`（PyInstaller 只在打包时需要，不进正常运行时的 `requirements.txt`）。
+- **③ 用量统计面板**：新增表 `llm_usage_log`（`slot`/`model_name`/`ok`/`prompt_tokens`/`completion_tokens`/`total_tokens`/`error_message`/`created_at`），`app/core/llm_client.py` 的 `OpenAICompatibleClient` 新增 `last_usage`（记录响应里的 `usage` 字段，`init=False`，纯粹是调用产生的结果）。新增 `app/core/llm_usage.py`：`UsageTrackingLLMClient` 包一层 `LLMClient`，调用成功/失败都记一笔账，对上层业务代码完全透明；`app/core/llm_factory.build_client` 从这次开始返回包了这一层的客户端。Dashboard 新增"用量统计"页（`GET /dashboard/usage`），按轻量/重量槽位汇总调用次数（成功/失败）和累计 token 数，附最近 50 条明细。明确不做费用估算——各家模型服务商定价、套餐、汇率都不一样，本地 App 没办法可靠算出真实花费，宁可只给两个确定不会算错的数字（次数、token 数），也不给一个算错了会误导人的金额。
+- **④ 整体异常处理**：`app/main.py` 新增全局兜底异常处理器 `handle_unexpected_exception`（`@app.exception_handler(Exception)`）——只接住各路由自己 try/except 之外、真正没预料到的错误（各路由已有的 `except ModelNotConfiguredError`/`except JDNotFoundError` 之类不受影响，FastAPI 对 `HTTPException` 的默认处理也不受影响，因为这个处理器只注册在裸的 `Exception` 类型上，更具体的处理器优先）。按请求路径区分响应格式：`/dashboard` 开头返回一个和其他页面观感一致的友好 HTML 错误页（新增 `error.html`），其余（插件专用的 `/api/...` 等）返回 `{"detail": ...}` 形状的 JSON——特意保持这个字段名和 FastAPI `HTTPException` 默认错误响应一致，因为插件侧 `service_worker.js` 已经在读 `body.detail` 展示错误，不该为了"意外错误"这一种情况单独发明一套响应格式。真实异常始终先完整记到日志（`logger.exception` 带完整堆栈），返给用户的只是异常摘要——和其他路由里已有的 `f"失败: {exc}"` 这类约定保持一致,不是这里单独放宽了什么（这个本地 App 本来就只监听 127.0.0.1、单用户使用）。
+
+### 设计取舍（有意简化，供后续 Phase 参考）
+
+1. **新增风格模板要手动登记进 `AVAILABLE_RESUME_STYLES`，不自动扫描 `resume_styles/` 目录**：避免一个还没写完/写错了的模板文件意外出现在用户可选列表里。
+2. **换风格重新生成 PDF 失败时不吞异常，直接让调用方感知**：这和 `confirm_and_finalize` 里"PDF 渲染失败只是不改 `pdf_path`、悄悄跳过"的策略刻意不同——那边"生成简历"是一个更大的操作，PDF 只是附带产物；这边"换个风格重新生成"本身就是用户点的这一个动作，没有更大的操作需要保护，失败了应该被看见。
+3. **打包只做 Windows 的验证止步于云端 Linux 环境能验证的部分**：PyInstaller 不能跨平台编译，云端沙盒只能验证"打包配置本身对不对"（数据文件带没带上、`app_root()` 在打包后的进程里能不能找对路径、迁移/模板渲染/WeasyPrint 出 PDF 这条链路完不完整）——这些都在 Linux 环境下实际构建并跑通了，但真正给 Windows 用户用的 `.exe` 需要用户自己在 Windows 机器上按同一份 spec 构建一次，见"遇到的问题与解决"里的验证记录。
+4. **用量统计不做费用估算**：理由已经写进 `LLMUsageLog` 的类文档字符串，这里不重复。
+
+### 遇到的问题与解决
+
+**问题一：`importlib.reload` 模拟"WeasyPrint import 失败"的测试技巧，残留的类身份污染了同一个 pytest 进程里其他模块的 `except`/`isinstance` 判断**
+
+现象：写"换风格重新生成 PDF、遇到未知 style_id 应该报错"这条测试时，`pytest.raises(UnknownResumeStyleError)` 明明看着代码逻辑是对的，却死活抓不住 `resume_tailor.regenerate_resume_pdf` 抛出的异常实例，两边像是完全不同的两个类。
+
+原因：Phase 4 补充阶段为了测试"模块被 import 的那一刻 `import weasyprint` 本身就抛异常"这个场景，用了 `sys.modules['weasyprint'] = None` + `importlib.reload(resume_pdf)` 这个标准技巧，测试完再 reload 回来恢复真实 WeasyPrint。但 `importlib.reload` 每次都会重新执行整个模块的类定义，产生和之前不是同一个身份的新 `UnknownResumeStyleError`/`PdfRenderingUnavailableError` 类对象；`resume_tailor.py` 在自己模块顶层用 `from app.services.resume_pdf import UnknownResumeStyleError` 这种写法绑定的是那次 reload **之前**的旧类对象，不会跟着 reload 更新。pytest 默认按文件名顺序收集测试，`test_resume_pdf.py` 排在 `test_resume_tailor.py` 前面，等后者的用例真正跑起来时，`resume_pdf` 模块已经被前面那条测试 reload 过两次（模拟失败一次、恢复一次），产生的是第三代类对象，和 `resume_tailor.py` 一开始绑定的第一代类对象完全不是同一个身份——这个副作用会一直残留到当前 pytest 进程结束，不只影响写测试的那一个文件，是那种"看起来毫不相关的两个测试文件互相干扰"的典型情况。
+
+解决：不再用"当前进程内 reload"来模拟这个场景，改成在一个全新的子进程里跑（`subprocess.run([sys.executable, "-c", 脚本])`，脚本里设置 `sys.modules['weasyprint'] = None` 之后 `import app.services.resume_pdf`）——子进程结束就销毁，不会污染当前测试进程里其他模块已经绑定好的类引用，而且这也更贴近真实故障场景本身（用户机器上是"整个进程刚启动、`import weasyprint` 第一次执行就失败"，不是"进程运行中途重新加载一个模块"）。这条经验值得记下来：任何用 `importlib.reload` 模拟模块加载失败的测试技巧，只要模块里定义了会被其他模块用 `from x import Y` 引用的类/异常，就要考虑这种残留污染，子进程隔离通常比"reload 回来就没事了"更可靠。
+
+**问题二：`ensure_pdf_dependency` 里"自动安装成功但当次探测仍未通过"这个分支，第一版把它当成了失败**
+
+见"Phase 4 补充"一节，这个 bug 是在写那个 Phase 的测试时发现并修复的，不属于本次 Phase 5 新引入，这里不重复记录，只是提醒——Phase 5 的换风格/打包/用量统计/异常处理这几项功能本身没有出现类似"看起来对、实际语义反了"的设计错误，这条经验在写 `regenerate_resume_pdf` 的"失败不吞异常"逻辑时特意对照检查过。
+
+**问题三：`TestClient` 默认会在测试里重新抛出全局异常处理器已经处理过的异常，看起来像是处理器没生效**
+
+现象：写全局异常处理器的测试时，临时挂一条一定会抛 `RuntimeError` 的路由，第一版直接用 `TestClient(app)` 发请求，结果测试还是因为这个 `RuntimeError` 直接失败退出，看起来像是 `@app.exception_handler(Exception)` 根本没被调用到——但服务器端日志明明打印出了处理器里 `logger.exception(...)` 那一行，说明处理器其实跑过了。
+
+原因：Starlette 的 `ServerErrorMiddleware` 设计上是"调用完注册的异常处理器、把处理器返回的响应发送给客户端之后，仍然重新抛出原始异常"——这是特意的行为，方便真实服务器场景下的日志/监控系统感知到这里发生过一次意外错误；`TestClient` 默认 `raise_server_exceptions=True`，会把这次重新抛出的异常继续往测试代码里传，掩盖了"响应其实已经按预期返回了"这个事实。
+
+解决：测试全局异常处理器的响应内容时，`TestClient` 要显式传 `raise_server_exceptions=False`，让它只关心处理器返回的响应本身,不去关心背后有没有重新抛出原始异常（这条设置只应该用在专门测试"异常处理器行为对不对"这一类用例上,其他所有测试都应该保持默认的 `True`,这样代码里真正的 bug 才会在测试阶段就暴露出来,而不是被兜底处理器悄悄盖住)。
+
+### 验证结果
+
+- 新增/扩展测试文件：`test_paths.py`（新增，6 条）、`test_resume_pdf.py`（新增 3 条：`compact` 风格渲染/PDF 生成、`AVAILABLE_RESUME_STYLES` 完整性；同时把"模块 import 失败"那条测试改成子进程隔离，见"问题一"）、`test_resume_tailor.py`（新增 4 条：换风格成功/版本不存在/未知风格/渲染失败分别的行为）、`test_dashboard.py`（新增 8 条：风格选择器渲染、确认时选择风格、非法风格值回退默认、重新生成 PDF 的成功/404/未知风格路径、用量统计页的空状态/有数据状态）、`test_llm_usage.py`（新增，6 条：记账函数、包装类的成功/失败路径、内层客户端没有 `last_usage` 属性时的兼容、`build_client` 接线）、`test_error_handling.py`（新增，4 条：`/dashboard` 路径友好 HTML、非 `/dashboard` 路径 JSON、真实异常确实被记到日志、已有的 `HTTPException`（404）不受这道新安全网影响）。
+- 全量跑 `backend` 目录下 pytest，**254 条用例全部通过**，零回归（对照 Phase 4 补充结束时的 205 条：新增 49 条）。
+- PyInstaller 打包链路在云端 Linux 沙盒环境里实际构建并运行验证：`pyinstaller packaging/jobpilot.spec` 构建成功；用一个空的 `JOBPILOT_HOME` 启动打包出来的可执行文件，日志里能看到 alembic 从空库一路升级到最新版本；`curl` 请求 `/dashboard/jobs`、`/dashboard/models`、`/dashboard/usage` 都能正确渲染出对应页面（证明 Jinja2 模板目录在打包后被正确找到）；新建一条 JD 之后，直接调用"生成简历"确认接口（不需要配置模型，K=0 且没有命中/延伸建议，不触发任何 LLM 调用）指定 `compact` 风格，成功生成并能下载到一份合法的 PDF 文件（证明 WeasyPrint、字体、`resume_styles/compact.html` 在打包后都能正常工作）。这证明了打包配置本身是对的；真正要分发给 Windows 用户的 `.exe`，需要用户在自己的 Windows 机器上用同一份 `packaging/jobpilot.spec` 构建一次（PyInstaller 不能跨平台编译），云端环境没法代为完成这一步。
+
+### 涉及文件
+
+`backend/app/core/paths.py`（新增）、`backend/app/core/migrate.py`、`backend/app/services/resume_pdf.py`（`AVAILABLE_RESUME_STYLES` + `app_root()`）、`backend/app/services/resume_tailor.py`（新增 `regenerate_resume_pdf`/`ResumeVersionNotFoundError`）、`backend/app/templates/resume_styles/compact.html`（新增）、`backend/app/templates/resume_tailor.html`、`backend/app/templates/resume_result.html`、`backend/app/api/routes_dashboard.py`（风格选择、`regenerate-pdf` 路由、`usage` 路由，`TEMPLATES_DIR` 改用 `app_root()`）、`backend/packaging/jobpilot.spec`（新增）、`backend/packaging/requirements-build.txt`（新增）、`backend/app/models/tables.py`（新增 `LLMUsageLog`）、`backend/alembic/versions/58f037add887_phase5_llm_usage_log.py`（新增）、`backend/app/core/llm_client.py`（`OpenAICompatibleClient.last_usage`）、`backend/app/core/llm_usage.py`（新增）、`backend/app/core/llm_factory.py`（接入 `UsageTrackingLLMClient`）、`backend/app/templates/usage.html`（新增）、`backend/app/templates/base.html`（导航新增"用量统计"）、`backend/app/main.py`（全局异常处理器）、`backend/app/templates/error.html`（新增）、`backend/tests/test_paths.py`（新增）、`backend/tests/test_llm_usage.py`（新增）、`backend/tests/test_error_handling.py`（新增）、`backend/tests/test_resume_pdf.py`、`backend/tests/test_resume_tailor.py`、`backend/tests/test_dashboard.py`、`.gitignore`（新增 `backend/build/`/`backend/dist/`）、`README.md`（新增"七、简历风格自定义""八、用量统计面板""九、打包成独立可执行文件分发"三节）
+
+---

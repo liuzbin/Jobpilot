@@ -6,14 +6,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from alembic import command
 from alembic.config import Config
 
 from app.core.config import Settings
+from app.core.paths import app_root
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = app_root()
 
 
 def run_migrations(settings: Settings) -> None:

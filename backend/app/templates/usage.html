@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}用量统计 - JobPilot{% endblock %}
+{% block content %}
+<h1>用量统计</h1>
+<p class="muted">只统计调用次数和 token 数（部分模型服务的响应不带 usage 字段，这种情况下 token 数会记不到，不代表没调用成功）。不做费用估算——每个人配置的模型服务定价、套餐都不一样，这不是本地 App 能可靠算出来的信息，算错了比不算更容易误导人，具体花了多少钱请对照你自己那边模型服务商的账单。</p>
+
+{% for slot in ['light', 'heavy'] %}
+<div class="card">
+  <h2>{{ '轻量模型' if slot == 'light' else '重量模型' }}（{{ slot }}）</h2>
+  {% set s = summary[slot] %}
+  {% if s.total_calls == 0 %}
+    <p class="muted">还没有调用记录。</p>
+  {% else %}
+    <p>
+      调用次数：<strong>{{ s.total_calls }}</strong>
+      （成功 {{ s.ok_calls }} / 失败 {{ s.failed_calls }}）
+      · 累计 token 数：<strong>{{ s.total_tokens }}</strong>
+    </p>
+  {% endif %}
+</div>
+{% endfor %}
+
+<div class="card">
+  <h2>最近调用明细（最多 50 条）</h2>
+  {% if not recent_logs %}
+    <p class="muted">还没有任何调用记录——去 JD 详情页点"分析"，或者生成一次简历，就会看到记录出现在这里。</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>时间</th><th>槽位</th><th>模型</th><th>结果</th><th>Token 数</th><th>备注</th></tr>
+    </thead>
+    <tbody>
+      {% for log in recent_logs %}
+      <tr>
+        <td class="muted">{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') if log.created_at else '-' }}</td>
+        <td>{{ '轻量' if log.slot.value == 'light' else '重量' }}</td>
+        <td>{{ log.model_name or '-' }}</td>
+        <td>{% if log.ok %}<span class="status-badge status-analyzed">成功</span>{% else %}<span class="status-badge status-analyzing" style="background:#ef4444;">失败</span>{% endif %}</td>
+        <td>{{ log.total_tokens if log.total_tokens is not none else '-' }}</td>
+        <td class="muted" style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ log.error_message or '' }}">{{ log.error_message or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endblock %}

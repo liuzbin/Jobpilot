@@ -55,6 +55,16 @@
   </div>
 
   <div class="card">
+    <h2>简历风格</h2>
+    <label>选择排版风格（生成之后也可以在结果页随时换一套重新生成 PDF，不需要重新走这个流程）</label>
+    <select name="style_id">
+      {% for sid, label in available_styles.items() %}
+        <option value="{{ sid }}">{{ label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="card">
     <button type="submit">生成简历</button>
   </div>
 </form>

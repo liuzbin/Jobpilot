@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{ resume.basic.full_name or "简历" }}</title>
+<style>
+  {# 和 default.html 用同一套 resume_json 结构（resume.basic / resume.experience[].items[]），
+     只是排版更紧凑——更小的页边距和行距、用一条彩色细线加姓名做视觉锚点，
+     贡献句去掉项目符号改成一行一条紧凑排布，目标是同样的内容尽量少占页数。
+     两套风格模板除了 CSS 和局部标签结构不一样，读的是完全相同的数据，互相
+     切换不会丢失/改变任何简历内容。 #}
+  @page {
+    size: A4;
+    margin: 12mm 14mm;
+  }
+  body {
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "SimSun", Arial, sans-serif;
+    font-size: 9.5pt;
+    color: #222;
+    line-height: 1.32;
+    margin: 0;
+  }
+  .header {
+    border-bottom: 1.5pt solid #2b5797;
+    padding-bottom: 2mm;
+    margin-bottom: 4mm;
+  }
+  h1 {
+    font-size: 15pt;
+    color: #2b5797;
+    margin: 0 0 1mm 0;
+  }
+  .target-title {
+    font-size: 9.5pt;
+    color: #444;
+    margin: 0 0 1mm 0;
+  }
+  .contact {
+    font-size: 8.5pt;
+    color: #666;
+    margin: 0;
+  }
+  h2 {
+    font-size: 10.5pt;
+    color: #2b5797;
+    text-transform: uppercase;
+    letter-spacing: 0.5pt;
+    margin: 4mm 0 2mm 0;
+  }
+  .position-block {
+    margin-bottom: 2.5mm;
+    break-inside: avoid;
+  }
+  .position-header {
+    font-weight: bold;
+    font-size: 9.5pt;
+  }
+  .bullet-line {
+    margin: 0.3mm 0 0.3mm 3mm;
+  }
+  .bullet-line::before {
+    content: "· ";
+    color: #2b5797;
+  }
+  .empty-note {
+    color: #888;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>{{ resume.basic.full_name or "（未填写姓名）" }}</h1>
+    {% if resume.basic.target_title %}
+    <p class="target-title">{{ resume.basic.target_title }}</p>
+    {% endif %}
+    <p class="contact">{{ [resume.basic.email, resume.basic.phone] | select | join(" · ") }}</p>
+  </div>
+
+  <h2>工作经历</h2>
+  {% for position in resume.experience %}
+    <div class="position-block">
+      <div class="position-header">{{ [position.position_title, position.project_name] | select | join(" / ") }}</div>
+      {% for item in position['items'] %}
+        <div class="bullet-line">{{ item.action_summary }}{% if item.result_summary %}，{{ item.result_summary }}{% endif %}</div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="empty-note">（本版本没有命中任何真实经历或已确认的延伸建议）</p>
+  {% endfor %}
+</body>
+</html>

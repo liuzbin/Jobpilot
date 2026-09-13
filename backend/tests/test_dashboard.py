@@ -189,6 +189,57 @@ def test_models_update_unknown_slot_returns_404():
         assert r.status_code == 404
 
 
+def test_usage_page_shows_empty_state_before_any_llm_call():
+    with _client() as client:
+        r = client.get("/dashboard/usage")
+        assert r.status_code == 200
+        assert "还没有调用记录" in r.text
+        assert "还没有任何调用记录" in r.text
+
+
+def test_usage_page_shows_aggregated_stats_and_recent_log():
+    from app.core.db import get_sessionmaker
+    from app.models.tables import LLMUsageLog, ModelSlot
+
+    with _client() as client:
+        # 先随便发一个请求，确保 TestClient 的 lifespan 已经跑完迁移
+        # （llm_usage_log 这张表才存在），再直接写库模拟历史调用记录——
+        # 不通过真实 LLM 调用，这里只关心 Dashboard 页面渲染逻辑本身。
+        client.get("/dashboard/jobs")
+
+        db = get_sessionmaker()()
+        try:
+            db.add(
+                LLMUsageLog(
+                    slot=ModelSlot.LIGHT,
+                    model_name="gpt-test",
+                    ok=True,
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    total_tokens=15,
+                )
+            )
+            db.add(
+                LLMUsageLog(
+                    slot=ModelSlot.LIGHT,
+                    model_name="gpt-test",
+                    ok=False,
+                    error_message="调用超时",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        r = client.get("/dashboard/usage")
+        assert r.status_code == 200
+        assert "gpt-test" in r.text
+        assert "调用超时" in r.text
+        # 轻量模型：2 次调用（1 成功 1 失败），累计 15 token
+        assert "2" in r.text
+        assert "15" in r.text
+
+
 def test_analyze_without_configured_models_shows_friendly_error():
     with _client() as client:
         create = client.post(
@@ -546,6 +597,120 @@ def test_resume_pdf_download_missing_resume_returns_404():
         jd_url = _seed_jd_with_score(client)
         r = client.get(f"{jd_url}/resumes/99999/pdf")
         assert r.status_code == 404
+
+
+# ---------- Phase 5：简历风格自定义 ----------
+
+
+def test_tailor_draft_page_includes_style_selector():
+    with _client() as client:
+        _seed_position_via_upload(client)
+        create = client.post(
+            "/dashboard/jobs",
+            data={
+                "company": "Beta Inc",
+                "title": "Big Data Engineer",
+                "description_raw": "We need Hadoop experience for our data platform.",
+            },
+            follow_redirects=False,
+        )
+        jd_url = create.headers["location"].split("?")[0]
+
+        # k=0：不做技能延伸，只需要一次 JD 解析调用，不需要另外准备重量模型
+        # 的延伸建议响应——这个测试只关心"风格下拉框有没有渲染出来"，
+        # 没必要把 build_resume_draft 完整的建议链路也搭一遍。
+        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
+        app.dependency_overrides[get_light_client] = lambda: jd_parse_fake
+        app.dependency_overrides[get_heavy_client] = lambda: jd_parse_fake
+        try:
+            r = client.get(f"{jd_url}/tailor", params={"k": 0})
+        finally:
+            app.dependency_overrides.pop(get_light_client, None)
+            app.dependency_overrides.pop(get_heavy_client, None)
+
+        assert r.status_code == 200
+        assert '<select name="style_id">' in r.text
+        assert "默认（简洁单栏）" in r.text
+        assert "紧凑（更小间距，适合内容较多）" in r.text
+
+
+def test_tailor_confirm_respects_selected_style():
+    with _client() as client:
+        position_id = _seed_position_via_upload(client)
+        jd_url = _seed_jd_with_score(client)
+
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "compact"},
+            follow_redirects=True,
+        )
+        assert confirm.status_code == 200
+        assert "紧凑（更小间距，适合内容较多）" in confirm.text
+
+
+def test_tailor_confirm_falls_back_to_default_style_on_bogus_value():
+    """表单被篡改提交了一个不在 AVAILABLE_RESUME_STYLES 里的 style_id 时，
+    应该悄悄回退到 default，而不是让整个"生成简历"操作报错。"""
+    with _client() as client:
+        _seed_position_via_upload(client)
+        jd_url = _seed_jd_with_score(client)
+
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={
+                "k_value": "0",
+                "hit_items_json": "[]",
+                "suggestion_count": "0",
+                "style_id": "no-such-style",
+            },
+            follow_redirects=True,
+        )
+        assert confirm.status_code == 200
+        assert "简历已生成" in confirm.text
+        assert "默认（简洁单栏）" in confirm.text
+
+
+def test_resume_regenerate_pdf_switches_style_and_flashes_success():
+    with _client() as client:
+        _seed_position_via_upload(client)
+        jd_url = _seed_jd_with_score(client)
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "default"},
+            follow_redirects=True,
+        )
+        result_url = confirm.url.path
+
+        regenerate = client.post(f"{result_url}/regenerate-pdf", data={"style_id": "compact"}, follow_redirects=True)
+        assert regenerate.status_code == 200
+        assert "已按新风格重新生成 PDF" in regenerate.text
+        assert "紧凑（更小间距，适合内容较多）" in regenerate.text
+
+
+def test_resume_regenerate_pdf_missing_version_returns_404():
+    with _client() as client:
+        jd_url = _seed_jd_with_score(client)
+        resume_id = 99999
+        r = client.post(f"{jd_url}/resumes/{resume_id}/regenerate-pdf", data={"style_id": "compact"})
+        assert r.status_code == 404
+
+
+def test_resume_regenerate_pdf_unknown_style_shows_friendly_flash_error():
+    with _client() as client:
+        _seed_position_via_upload(client)
+        jd_url = _seed_jd_with_score(client)
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "default"},
+            follow_redirects=True,
+        )
+        result_url = confirm.url.path
+
+        regenerate = client.post(
+            f"{result_url}/regenerate-pdf", data={"style_id": "no-such-style"}, follow_redirects=True
+        )
+        assert regenerate.status_code == 200
+        assert "未知的简历风格" in regenerate.text
 
 
 # ---------- Phase 2 补完：问答题库（qa_bank） ----------
