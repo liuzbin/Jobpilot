@@ -44,6 +44,8 @@ JobPilot 是一个运行在用户本地电脑上的求职辅助 Agent 工具，�
 
 **独立项目表 `personal_project` + `personal_project_bullet`（本版本 v8 新增）**：`personal_project` 存项目名称、起止时间、是否在做，`personal_project_bullet` 是它的贡献句子表（一对多，级联删除）。用来承载不挂靠任何公司的课外/开源项目——这类经历在 `experience_entry` 的 A/B/C 三层结构里没有自然的落脚点（A 层是公司），所以单独建表。同样是静态背景信息，精确匹配去重（项目名完全一致）。
 
+**结构化技能标签表 `profile_skill`（本版本 v9 新增，LinkedIn 画像导入）**：`skill_name`、`order_index`、创建时间，一行一个技能名，对照 LinkedIn Skills 板块的扁平标签结构。之所以单独开表、不复用 `profile_basic.skills_text` 那段自由文本，是因为这批数据主要来自插件抓取 LinkedIn 页面——抓取本身就是离散的标签，不需要（也不应该）再喂 LLM 做分段/分类，按技能名精确去重合并成本最低。`skills_text` 完全保留不受影响，生成简历时两者合并展示（结构化标签里 `skills_text` 没提到过的部分追加成一行）。**`profile_basic` 同版本新增 `additional_notes` 字段**（用户自评的优势/劣势、求职偏好等），是目前唯一一处会真正进入 JD 匹配打分 LLM 语义判断的静态背景信息——`compute_score` 的确定性数值计算不读这个字段，只通过 `scoring.build_profile_context` 传给 LLM，体现在 strengths/weaknesses 里，不会被写进任何生成出来的简历正文。**`personal_project` 同版本新增 `company_tag` 字段**（自由文本，只在项目一侧加、不改 `experience_entry`、不建外键），用来人工标出某个独立项目其实和哪家公司的经历是同一件事，走“只填空、不覆盖用户手动填过的值”的合并逻辑，纯粹用于画像页面上的人工关联展示，不参与任何合并/打分/简历生成逻辑。
+
 **MD 简历模板表 `resume_template`（本版本 v8 新增）**：`name`、`content`（用户编写的 Jinja2 模板文本）、`is_default`（保证库里始终有且只有一个默认模板）、创建/更新时间。见 5.3 节"简历风格改为 MD 模板驱动"。
 
 **工作经历树 `experience_entry`**：按 A/B/C 三层结构落地为一张自关联表加一张贡献句表。`experience_entry` 表存 A 层（公司）和 B 层（项目+岗位+时间区间），用 `parent_id` 做层级关联，`level` 字段区分 A/B。已在 Phase 0/1 落地。**Phase 2 计划在 B 层新增两个字段**：`background_notes`（大文本，"项目背景与理解"，承载简历重制阶段做技能延伸判断所需的上下文——项目背景、技术架构、数据规模、用户自己认为有挑战或值得展开的地方）和 `background_qa`（JSON，追问式访谈的原始问答记录，用于追溯 `background_notes` 是怎么来的、方便用户后续追加）。这两个字段不是要求用户一次性写完的空白表单，而是通过"追问式访谈"机制逐步填充，详见五、核心模块详细设计。

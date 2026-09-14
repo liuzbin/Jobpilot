@@ -637,3 +637,79 @@ Phase 4 补充版本的 `_run_silent_install` 用 `subprocess.run([installer_pat
 `backend/app/models/tables.py`（新增 `EducationEntry`/`PersonalProject`/`PersonalProjectBullet`/`ResumeTemplate` 四张表，`ProfileBasic` 新增 `resume_summary`/`skills_text`，`ResumeVersion` 新增 `resume_template_id`）、`backend/alembic/versions/7524cc414385_phase6_md_resume_template_and_static_.py`（新迁移脚本）、`backend/app/services/resume_md_parser.py`（新增，规则解析器）、`backend/app/services/resume_ingest.py`（`extract_and_structure` 路由逻辑）、`backend/app/services/resume_template_service.py`（新增，MD 模板库 CRUD + 渲染校验）、`backend/app/services/resume_pdf.py`（新增 MD 模板渲染管线）、`backend/app/services/resume_tailor.py`（`resume_json` 新增静态背景信息四个键，`confirm_and_finalize`/`regenerate_resume_pdf` 支持 `resume_template_id`）、`backend/app/services/profile_service.py`（教育经历/独立项目的合并+CRUD，`format_date_range`）、`backend/app/api/routes_dashboard.py`（教育经历/独立项目/MD 模板库的新路由，`render_choice` 表单字段改造）、`backend/app/templates/base.html`（导航新增"简历模板"链接）、`backend/app/templates/profile.html`（个人总结/技能表单字段，教育经历/独立项目管理卡片）、`backend/app/templates/resume_templates.html`（新增，模板库管理页面）、`backend/app/templates/resume_tailor.html`、`backend/app/templates/resume_result.html`（`render_choice` 下拉框改造）、`backend/app/templates/resume_styles/default.html`、`backend/app/templates/resume_styles/compact.html`（补上公司名+时间显示）、`backend/app/templates/resume_styles/_markdown_generic.html`（新增，MD 模板渲染的通用 CSS 外壳）、`backend/requirements.txt`（新增 `markdown==3.7`）、对应的六个新测试文件和两个既有测试文件的针对性修复（见"验证结果"）、`README.md`（新增"十一、简历 MD 模板库 + 简历上传规则解析"一节）、`docs/JobPilot_实施方案.md`（版本号更新，数据模型/模块设计/分阶段实施计划/风险清单同步）。
 
 ---
+
+
+## LinkedIn 画像导入（后端部分）：结构化 Skills、独立项目关联公司标签、备注信息喂给 JD 打分 LLM（2026-09-14）
+
+**背景**：用户提出要能解析 LinkedIn 个人主页来补充画像，画像结构对照 LinkedIn 的
+真实板块划分成五块：基本信息（含个人简介）、skills、教育信息、工作经历、项目经历。
+这条需求经过三轮澄清（细节见对话记录，这里只记结论）：
+
+- **数据来源机制**：一开始考虑过后端直接按 URL 抓取，但 LinkedIn 对未登录请求有
+  登录墙，抓不到真实内容——这条路线在设计阶段就被否掉了。最终定为插件侧现场抓取：
+  用户在插件侧边栏"添加 LinkedIn profile 到 JobPilot"里粘贴自己的 LinkedIn 个人
+  主页地址，插件在用户本人已登录状态下导航过去，用内容脚本做纯 DOM 抓取（不需要
+  LLM），再通过 background service worker 发到本地 App。**插件侧这部分本次没有
+  实现**，只实现了后端接口和数据模型，插件侧（侧边栏 UI + 内容脚本）是下一步。
+- **Skills 结构**：改成结构化的扁平标签列表（新表 `profile_skill`），而不是塞进
+  `profile_basic.skills_text` 那段自由文本里——因为 LinkedIn 抓取出来的本身就是
+  一份份离散的标签，不需要（也不应该）再喂给 LLM 做"分段/分类"，按标签名精确去重
+  合并成本最低。原有的 `skills_text` 自由文本字段完全保留、不受影响，两者在生成
+  简历时合并展示（见下）。
+- **独立项目关联公司的方式**：只在 `personal_project` 一侧加一个自由文本标签字段
+  `company_tag`，不改 `experience_entry`、不建外键。用户的原话是"当作独立项目
+  列出，但是给一个 tag 用来和公司关联……只是各自有各自的独立的表述罢了"——两边
+  各自保留独立描述，标签只是方便人工一眼看出这是同一件事。
+- **备注信息字段的定位**：新增 `profile_basic.additional_notes`，是"给 LLM 的
+  附加信息"，比如用户自评的优势/劣势、求职偏好，明确要求"LLM 会加以考虑，并体现
+  在分析结果里"。这是目前唯一一处会真正进入 JD 匹配打分 LLM 语义判断的"静态背景
+  信息"——和 `resume_summary`/`skills_text`/教育经历/独立项目那批"原样带进简历、
+  不参与打分"的静态背景信息刻意不同。`scoring.compute_score` 的确定性数值计算
+  完全不读这个字段（"打分要对用户保持诚实"这条核心原则没有被打破），只是通过
+  `build_profile_context` 把它传给 LLM，在 `SCORING_SYSTEM_PROMPT` 里明确要求
+  LLM 拿它做参考、但不能不加验证地照抄进 strengths。
+
+**实现**：
+
+- `profile_basic` 新增 `additional_notes`（Text，可空）；`personal_project` 新增
+  `company_tag`（String(300)，可空）；新表 `profile_skill`（`id`/`skill_name`/
+  `order_index`/`created_at`）。新增 alembic 迁移
+  `006e4ea1c7b4_phase7_linkedin_profile_skills_and_.py`。
+- `profile_service.py`：`additional_notes` 加入 `BASIC_FIELDS`（走和
+  `resume_summary`/`skills_text` 一样的"整体覆盖"逻辑，但 Dashboard 上走独立小
+  表单提交，避免被主表单的空值覆盖）；新增 `_merge_profile_skills`（精确去重，
+  大小写不敏感）、`get_profile_skills`/`add_profile_skill`/`delete_profile_skill`
+  手动 CRUD；`_merge_personal_projects` 扩展支持 `company_tag`（新建项目直接带上，
+  已存在项目只在标签为空时才补，不覆盖用户手动填的值）；`update_personal_project`
+  同步支持单独更新 `company_tag`；`merge_parsed_experience` 顶层新增识别
+  `parsed["skills"]` 这个 key（简历上传解析出的 parsed 字典没有这个 key，完全
+  向后兼容）。
+- `scoring.py`：`build_profile_context` 的 `basic` 字典新增 `additional_notes`；
+  `SCORING_SYSTEM_PROMPT` 新增一段说明，要求 LLM 把它当候选人自己的补充背景来
+  理解、但仍要结合真实经历判断站不站得住脚。
+- `resume_tailor.py`：新增 `_build_skills_lines`，简历"技能"板块先输出
+  `skills_text` 按行拆出来的内容（完全不变），再追加一行由 `profile_skill` 里
+  "`skills_text` 里明显没提到过"的标签拼成的补充行，避免重复。
+- `routes_extension.py`：新增 `POST /api/linkedin-profile`（配对鉴权），payload
+  结构故意和 `merge_parsed_experience` 的 `parsed` 字典同构（`companies`/
+  `positions`/`bullets`、`education_entries`、`projects` 字段名和简历上传解析出
+  的结构一模一样），直接复用同一套合并逻辑（公司/职位模糊匹配、贡献句去重、教育
+  经历/独立项目精确去重），只是多了 `skills` 和 `projects[].company_tag` 两个
+  新字段；空 payload 返回 422（和 `/api/jobs` 的空描述兜底同一个道理）。
+- `routes_dashboard.py`：新增 `POST /dashboard/profile/notes`（备注信息单独提交）、
+  `POST /dashboard/profile/skills` + `/skills/{id}/delete`（技能标签增删）、
+  `POST /dashboard/profile/projects/{id}/tag`（只更新关联标签，不影响项目名称/
+  时间）。
+- `profile.html`：画像页重新组织成"备注信息（顶部独立文本框）→ 上传简历/
+  LinkedIn 导入入口说明 → 基本信息（含个人简介） → Skills（结构化标签）→ 教育
+  经历 → 工作经历 → 项目经历（独立项目，含关联公司标签的展示/编辑）"，对照 LinkedIn
+  的板块顺序。
+
+**验证结果**：新增 24 个测试用例（`profile_service` 的技能/标签合并与手动增删、
+`scoring.build_profile_context` 的 `additional_notes`、`resume_tailor` 的技能行
+合并、Dashboard 新路由、`/api/linkedin-profile` 端到端），全部 359 个测试
+（335 + 24）在云端沙盒和本机 Windows 独立虚拟环境两边分批跑通，无一失败。
+
+**遗留**：插件侧（侧边栏"添加 LinkedIn profile 到 JobPilot"UI、导航到目标 tab、
+纯 DOM 抓取的内容脚本 `linkedin_profile_parser.js`、background 转发逻辑）还没
+做，是下一个阶段。
