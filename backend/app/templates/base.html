@@ -45,6 +45,14 @@
     .qa-question { color: #1b1f24; font-weight: 600; }
     .qa-answer { color: #4b5563; }
     .suggestion-block { border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; margin-bottom: 12px; background: #fafafa; }
+    /* 调用 LLM 的表单提交后展示的加载提示：见页面底部的通用脚本说明。 */
+    .jobpilot-llm-loading { margin-top: 10px; display: flex; align-items: center; gap: 8px; color: #4b5563; font-size: 13px; }
+    .jobpilot-spinner {
+      width: 14px; height: 14px; flex: 0 0 auto;
+      border: 2px solid #d1d5db; border-top-color: #2563eb; border-radius: 50%;
+      display: inline-block; animation: jobpilot-spin 0.8s linear infinite;
+    }
+    @keyframes jobpilot-spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -62,5 +70,60 @@
     {% if flash %}<div class="flash {% if flash_error %}error{% endif %}">{{ flash }}</div>{% endif %}
     {% block content %}{% endblock %}
   </main>
+  <script>
+    // 通用的"调用 LLM 时不要让页面看起来卡住"提示：给需要展示加载态的表单加上
+    // data-llm-loading="提示文案" 属性，提交时会立刻禁用表单里的提交按钮、并
+    // 在表单下面插入一个带小圆圈动画的提示。这里刻意不改变原来"提交后等整页
+    // 刷新展示结果"的流程（LLM 调用本身仍然是同步阻塞的），只是把"看起来像
+    // 卡住了"变成"看得出来正在处理"——真正做到提交后可以离开页面、后台跑完
+    // 再通知的完整异步方案工作量大得多，暂时不做。
+    //
+    // GET 表单（比如"生成简历草稿"）和 POST 表单都适用：submit 事件在浏览器
+    // 真正发起导航之前触发，两种表单都能在这个事件里插入提示。
+    document.addEventListener("submit", function (event) {
+      var form = event.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      var message = form.getAttribute("data-llm-loading");
+      if (!message) return;
+
+      // 防止用户手快、在结果还没回来之前对同一个表单重复点提交，导致重复
+      // 触发一次同样耗时的 LLM 调用。
+      if (form.dataset.jobpilotSubmitting === "1") {
+        event.preventDefault();
+        return;
+      }
+      form.dataset.jobpilotSubmitting = "1";
+
+      var buttons = form.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])');
+      buttons.forEach(function (btn) { btn.disabled = true; });
+
+      var indicator = document.createElement("div");
+      indicator.className = "jobpilot-llm-loading";
+      var spinner = document.createElement("span");
+      spinner.className = "jobpilot-spinner";
+      indicator.appendChild(spinner);
+      indicator.appendChild(document.createTextNode(message));
+      form.appendChild(indicator);
+    });
+
+    // 同样的提示也适用于"点了之后跳一个会调用 LLM 的 GET 页面"的普通链接
+    // （比如"生成常见问题"这个 <a> 包 <button> 的入口，不是 <form>，submit
+    // 事件覆盖不到）。这里不阻止默认的页面跳转，只是在跳转发生前先插入提示，
+    // 让用户在浏览器真正开始加载下一页之前，能看到一下"正在处理"的反馈。
+    document.addEventListener("click", function (event) {
+      var link = event.target.closest("a[data-llm-loading]");
+      if (!link || link.dataset.jobpilotSubmitting === "1") return;
+      link.dataset.jobpilotSubmitting = "1";
+      link.style.pointerEvents = "none";
+
+      var indicator = document.createElement("div");
+      indicator.className = "jobpilot-llm-loading";
+      var spinner = document.createElement("span");
+      spinner.className = "jobpilot-spinner";
+      indicator.appendChild(spinner);
+      indicator.appendChild(document.createTextNode(link.getAttribute("data-llm-loading")));
+      link.insertAdjacentElement("afterend", indicator);
+    });
+  </script>
 </body>
 </html>

@@ -252,6 +252,102 @@ def test_merge_flags_is_current_conflict_only_when_incoming_is_true(db_session):
     assert result.position_field_conflicts[0]["field"] == "is_current"
 
 
+# ---------- 用户反馈：职位合并冲突检测扩展成模糊匹配（公司精确匹配 + 时间
+# 重叠或一方缺失 + 标题/项目名相似度达阈值），不用 LLM 判断 ----------
+
+
+def test_merge_flags_reworded_position_as_conflict_when_dates_overlap(db_session):
+    """标题/项目名不是精确一致，但时间区间完全重叠、文本相似度很高，应该判定
+    成"很可能是同一段经历的不同措辞"，走冲突确认而不是当成新职位插入。"""
+    merge_parsed_experience(
+        db_session, _parsed(position_title="Backend Engineer", project_name="Payments Platform")
+    )
+    result = merge_parsed_experience(
+        db_session,
+        _parsed(position_title="Backend Engineer", project_name="Payments Platform Rewrite", bullets=[]),
+    )
+
+    assert result.positions_added == 0
+    tree = get_experience_tree(db_session)
+    assert len(tree[0]["positions"]) == 1  # 没有插入第二条职位
+
+    field_conflicts = {c["field"] for c in result.position_field_conflicts}
+    assert "project_name" in field_conflicts
+    conflict = next(c for c in result.position_field_conflicts if c["field"] == "project_name")
+    assert conflict["old_value"] == "Payments Platform"
+    assert conflict["new_value"] == "Payments Platform Rewrite"
+
+    # 冲突没有被自动应用：画像里项目名还是原来那个
+    assert tree[0]["positions"][0]["project_name"] == "Payments Platform"
+
+
+def test_merge_does_not_fuzzy_match_when_dates_do_not_overlap(db_session):
+    """标题相似度很高，但两段时间完全不重叠（一段已经结束很久，另一段是新的），
+    不应该被误判成同一段经历——更可能是员工离职后又回同一家公司的不同岗位。"""
+    parsed1 = _parsed(position_title="Backend Engineer", project_name="Payments")
+    parsed1["companies"][0]["positions"][0].update(
+        {"start_date": "2015-01", "end_date": "2016-01", "is_current": False}
+    )
+    merge_parsed_experience(db_session, parsed1)
+
+    parsed2 = _parsed(position_title="Backend Engineer", project_name="Payments Rewrite", bullets=[])
+    parsed2["companies"][0]["positions"][0].update(
+        {"start_date": "2023-01", "end_date": None, "is_current": True}
+    )
+    result = merge_parsed_experience(db_session, parsed2)
+
+    assert result.positions_added == 1  # 当成一段独立的新职位插入
+    assert result.position_field_conflicts == []
+    tree = get_experience_tree(db_session)
+    assert len(tree[0]["positions"]) == 2
+
+
+def test_merge_fuzzy_matches_when_one_side_has_no_dates_at_all(db_session):
+    """有一方完全没填时间信息（没法比较是否重叠），不应该仅凭这一点就拒绝
+    模糊匹配，交给标题/项目名相似度决定。"""
+    parsed1 = _parsed(position_title="Data Scientist", project_name="Recommendation Engine")
+    parsed1["companies"][0]["positions"][0].update({"start_date": None, "end_date": None, "is_current": False})
+    merge_parsed_experience(db_session, parsed1)
+
+    parsed2 = _parsed(position_title="Data Scientist", project_name="Recommendation Engine Revamp", bullets=[])
+    parsed2["companies"][0]["positions"][0].update({"start_date": "2022-03", "end_date": None, "is_current": True})
+    result = merge_parsed_experience(db_session, parsed2)
+
+    assert result.positions_added == 0
+    field_conflicts = {c["field"] for c in result.position_field_conflicts}
+    assert "project_name" in field_conflicts
+
+
+def test_merge_does_not_fuzzy_match_dissimilar_titles_even_with_overlapping_dates(db_session):
+    """时间重叠、但标题/项目名完全不像同一件事，不应该被误判成冲突——两个
+    真的不相关的岗位凑巧时间有重叠是完全合理的（比如身兼数职）。"""
+    merge_parsed_experience(
+        db_session, _parsed(position_title="Backend Engineer", project_name="Payments Platform")
+    )
+    result = merge_parsed_experience(
+        db_session, _parsed(position_title="Marketing Intern", project_name="Brand Campaign", bullets=[])
+    )
+
+    assert result.positions_added == 1
+    assert result.position_field_conflicts == []
+
+
+def test_resolve_position_field_applies_new_project_name(db_session):
+    merge_parsed_experience(
+        db_session, _parsed(position_title="Backend Engineer", project_name="Payments Platform")
+    )
+    result = merge_parsed_experience(
+        db_session,
+        _parsed(position_title="Backend Engineer", project_name="Payments Platform Rewrite", bullets=[]),
+    )
+    conflict = next(c for c in result.position_field_conflicts if c["field"] == "project_name")
+
+    resolve_position_field(db_session, conflict["position_id"], "project_name", conflict["new_value"])
+
+    tree = get_experience_tree(db_session)
+    assert tree[0]["positions"][0]["project_name"] == "Payments Platform Rewrite"
+
+
 # ---------- Phase 2 补完：合并冲突确认（用户选择之后应用） ----------
 
 

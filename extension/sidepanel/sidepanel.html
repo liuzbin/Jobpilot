@@ -40,12 +40,23 @@
     </section>
 
     <section id="linkedin-hint-card" class="card" hidden>
-      <h2>抓取 LinkedIn 职位</h2>
-      <p class="hint">
-        打开一个 LinkedIn 职位详情页，页面右下角会出现一个"发送到 JobPilot"按钮，
-        点一下就会把这条职位信息发到本地 App 并自动打开对应的详情页，接下来的
-        分析、简历重制流程和手动粘贴 JD 完全一样。
-      </p>
+      <h2>发送当前职位到 JobPilot</h2>
+      <div id="send-job-ready" hidden>
+        <p class="hint">
+          检测到当前标签页是一个 LinkedIn 职位页面，点击下面的按钮就会把这条
+          职位信息发到本地 App 并自动打开对应的详情页，接下来的分析、简历重制
+          流程和手动粘贴 JD 完全一样。
+        </p>
+        <button id="send-job-btn" type="button">发送到 JobPilot</button>
+        <div id="send-job-status" class="detail"></div>
+      </div>
+      <div id="send-job-not-detected" hidden>
+        <p class="hint">
+          未检测到职位信息。请切换到一个 LinkedIn 职位详情页（网址形如
+          <code>linkedin.com/jobs/view/...</code>），这里会自动变成可以点击
+          发送的按钮，不需要在页面上另外找按钮。
+        </p>
+      </div>
     </section>
 
     <script src="sidepanel.js"></script>

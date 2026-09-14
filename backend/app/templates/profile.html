@@ -37,7 +37,7 @@
 <div class="card">
   <h2>上传简历自动建画像</h2>
   <p class="muted">支持 .pdf / .docx / .txt / .md。解析走"轻量模型"槽位，请先在模型配置页面填好。基本信息只会填补空白字段，工作经历会自动合并去重。</p>
-  <form method="post" action="/dashboard/profile/resume" enctype="multipart/form-data">
+  <form method="post" action="/dashboard/profile/resume" enctype="multipart/form-data" data-llm-loading="AI 正在解析简历，请稍候…">
     <input type="file" name="resume_file" accept=".pdf,.docx,.txt,.md" required>
     <div style="margin-top:12px;"><button type="submit">上传并解析</button></div>
   </form>

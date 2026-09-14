@@ -3,19 +3,21 @@
 依赖缺失时不该只提示手动安装，应该放进自动化流程里自动装"而做的自动安装
 GTK3 Runtime（仅 Windows）模块。
 
-真实的下载/静默安装/重启后生效这几步没办法在这个纯 Linux 的测试环境里端到
-端验证（本来就只在 Windows 上发生），这里覆盖的是能在任何平台上确定验证的
-部分：平台判断、探测函数的行为、`ensure_pdf_dependency` 的状态机分支（已就
-绪 / 未启用自动安装 / 退避期内跳过重试 / 自动安装成功但当次进程仍不可用 /
-自动安装失败）、以及下载 URL 解析、静默安装子进程调用的参数和异常处理逻辑
-——这些全部通过 monkeypatch 掉真正的网络请求和 subprocess 调用来做，不会
-真的联网或者执行任何安装程序。
+真实的下载/以 UAC 提权方式静默安装/重启后生效这几步没办法在这个纯 Linux 的
+测试环境里端到端验证（本来就只在 Windows 上发生，`_launch_elevated_and_wait`
+内部直接调用 `ctypes.windll`，这个属性在非 Windows 平台上根本不存在），这里
+覆盖的是能在任何平台上确定验证的部分：平台判断、探测函数的行为、
+`ensure_pdf_dependency` 的状态机分支（已就绪 / 未启用自动安装 / 退避期内跳过
+重试 / 自动安装成功但当次进程仍不可用 / 自动安装失败）、以及下载 URL 解析、
+`_run_silent_install` 对 `_launch_elevated_and_wait` 返回值/异常的处理逻辑
+（退出码非 0 / 超时 / UAC 授权框被取消 / 意外的 OSError）——这些全部通过
+monkeypatch 掉真正的网络请求和 `_launch_elevated_and_wait` 本身来做，不会
+真的联网、弹出任何系统弹窗，或者执行任何安装程序。
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 
 import pytest
 
@@ -215,25 +217,39 @@ def test_run_silent_install_raises_on_nonzero_exit_code(monkeypatch, tmp_path):
     fake_installer = tmp_path / "installer.exe"
     fake_installer.write_bytes(b"")
 
-    def _fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=1)
+    monkeypatch.setattr(
+        installer, "_launch_elevated_and_wait", lambda path, params, timeout: 1
+    )
 
-    monkeypatch.setattr(installer.subprocess, "run", _fake_run)
-
-    with pytest.raises(installer.GtkAutoInstallError, match="管理员"):
+    with pytest.raises(installer.GtkAutoInstallError, match="退出码非 0"):
         installer._run_silent_install(fake_installer)
 
 
-def test_run_silent_install_raises_on_timeout(monkeypatch, tmp_path):
+def test_run_silent_install_propagates_timeout_error(monkeypatch, tmp_path):
     fake_installer = tmp_path / "installer.exe"
     fake_installer.write_bytes(b"")
 
-    def _fake_run(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd="installer.exe", timeout=300)
+    def _boom(path, params, timeout):
+        raise installer.GtkAutoInstallError("GTK3 Runtime 安装程序超时（也可能是一直在等你确认 UAC 授权框）。")
 
-    monkeypatch.setattr(installer.subprocess, "run", _fake_run)
+    monkeypatch.setattr(installer, "_launch_elevated_and_wait", _boom)
 
     with pytest.raises(installer.GtkAutoInstallError, match="超时"):
+        installer._run_silent_install(fake_installer)
+
+
+def test_run_silent_install_propagates_uac_cancelled_error(monkeypatch, tmp_path):
+    """用户在系统弹出的 UAC 授权框里点了"否"，应该有一句能让用户看懂"是我自己
+    取消了授权"的提示，而不是一句看不懂的 Windows 错误码。"""
+    fake_installer = tmp_path / "installer.exe"
+    fake_installer.write_bytes(b"")
+
+    def _boom(path, params, timeout):
+        raise installer.GtkAutoInstallError("需要管理员权限才能安装 GTK3 Runtime，但系统弹出的授权确认框被取消了")
+
+    monkeypatch.setattr(installer, "_launch_elevated_and_wait", _boom)
+
+    with pytest.raises(installer.GtkAutoInstallError, match="取消"):
         installer._run_silent_install(fake_installer)
 
 
@@ -241,12 +257,28 @@ def test_run_silent_install_succeeds_on_zero_exit_code(monkeypatch, tmp_path):
     fake_installer = tmp_path / "installer.exe"
     fake_installer.write_bytes(b"")
 
-    def _fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=0)
-
-    monkeypatch.setattr(installer.subprocess, "run", _fake_run)
+    calls = []
+    monkeypatch.setattr(
+        installer,
+        "_launch_elevated_and_wait",
+        lambda path, params, timeout: calls.append((path, params, timeout)) or 0,
+    )
 
     installer._run_silent_install(fake_installer)  # 不应该抛异常
+    assert calls == [(fake_installer, "/S", installer._INSTALL_TIMEOUT_SECONDS)]
+
+
+def test_run_silent_install_wraps_unexpected_oserror(monkeypatch, tmp_path):
+    fake_installer = tmp_path / "installer.exe"
+    fake_installer.write_bytes(b"")
+
+    def _boom(path, params, timeout):
+        raise OSError("模拟启动失败")
+
+    monkeypatch.setattr(installer, "_launch_elevated_and_wait", _boom)
+
+    with pytest.raises(installer.GtkAutoInstallError, match="无法启动"):
+        installer._run_silent_install(fake_installer)
 
 
 def test_auto_install_gtk_runtime_refuses_on_non_windows(monkeypatch):

@@ -1143,3 +1143,79 @@ def test_delete_position_cascades_and_delete_company_cascades():
         assert "已删除公司及其下所有经历" in r.text
         assert "Acme Corp" not in r.text
         assert "你最大的优势是什么？" not in r.text  # 跳过的问题不应该被保存进题库
+
+
+# ---------- 用户反馈：调用 LLM 时页面不能看起来卡住（轻量方案：即时前端提示） ----------
+#
+# 这里只验证"会调用 LLM 的表单/链接确实带上了 data-llm-loading 属性"这个
+# 静态标记本身——真正的加载提示是纯前端 JS 行为（监听 submit/click 事件插入
+# 一个带小圆圈动画的提示），TestClient 不跑浏览器 JS，没办法端到端验证这一步，
+# 这一点和 base.html 里那段脚本的注释是一致的。
+
+
+def test_analyze_form_has_llm_loading_hint():
+    with _client() as client:
+        create = client.post(
+            "/dashboard/jobs",
+            data={"company": "Gamma LLC", "title": "Data Scientist", "description_raw": "Need Python."},
+            follow_redirects=False,
+        )
+        jd_url = create.headers["location"].split("?")[0]
+        r = client.get(jd_url)
+        assert 'data-llm-loading="AI 正在分析并打分，请稍候…"' in r.text
+
+
+def test_reanalyze_and_tailor_forms_have_llm_loading_hint():
+    with _client() as client:
+        jd_url = _seed_jd_with_score(client)
+        r = client.get(jd_url)
+        assert 'data-llm-loading="AI 正在重新分析并打分，请稍候…"' in r.text
+        assert 'data-llm-loading="AI 正在生成简历草稿，请稍候…"' in r.text
+
+
+def test_qa_bank_suggest_link_has_llm_loading_hint():
+    with _client() as client:
+        r = client.get("/dashboard/qa-bank")
+        assert 'data-llm-loading="AI 正在生成常见问题，请稍候…"' in r.text
+
+
+def test_resume_upload_form_has_llm_loading_hint():
+    with _client() as client:
+        r = client.get("/dashboard/profile")
+        assert 'data-llm-loading="AI 正在解析简历，请稍候…"' in r.text
+
+
+def test_interview_start_form_has_llm_loading_hint():
+    with _client() as client:
+        position_id = _seed_position_via_upload(client)
+        r = client.get(f"/dashboard/profile/positions/{position_id}")
+        assert 'data-llm-loading="AI 正在生成追问问题，请稍候…"' in r.text
+
+
+def test_interview_answer_form_has_llm_loading_hint():
+    with _client() as client:
+        position_id = _seed_position_via_upload(client)
+        fake_light = FakeLLMClient(responses=[dict(FAKE_QUESTIONS_RESPONSE)])
+        app.dependency_overrides[get_light_client] = lambda: fake_light
+        try:
+            r = client.get(f"/dashboard/profile/positions/{position_id}/interview")
+        finally:
+            app.dependency_overrides.pop(get_light_client, None)
+        assert 'data-llm-loading="AI 正在整理项目背景描述，请稍候…"' in r.text
+
+
+def test_tailor_regenerate_draft_form_has_llm_loading_hint():
+    with _client() as client:
+        jd_url = _seed_jd_with_score(client)
+        # k=0：不做技能延伸，画像里又没有任何经历可命中，所以这次 /tailor 不
+        # 会真的调用 light/heavy 任何一个 client，两个 Fake 只是用来满足路由
+        # "两个槽位都必须配置"这条前置检查。
+        app.dependency_overrides[get_light_client] = lambda: FakeLLMClient(responses=[])
+        app.dependency_overrides[get_heavy_client] = lambda: FakeLLMClient(responses=[])
+        try:
+            r = client.get(f"{jd_url}/tailor", params={"k": 0}, follow_redirects=True)
+        finally:
+            app.dependency_overrides.pop(get_light_client, None)
+            app.dependency_overrides.pop(get_heavy_client, None)
+        assert r.status_code == 200
+        assert 'data-llm-loading="AI 正在重新生成简历草稿，请稍候…"' in r.text

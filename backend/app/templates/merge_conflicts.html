@@ -29,8 +29,9 @@
   <div class="card">
     <h2>职位字段：{{ c.company_name or '' }} · {{ c.position_label }}</h2>
     <p class="muted">
-      {% if c.field == 'start_date' %}入职时间{% elif c.field == 'end_date' %}离职时间{% else %}是否至今在职{% endif %}
+      {% if c.field == 'start_date' %}入职时间{% elif c.field == 'end_date' %}离职时间{% elif c.field == 'position_title' %}岗位名称{% elif c.field == 'project_name' %}项目名称{% else %}是否至今在职{% endif %}
       和已有记录不一致：
+      {% if c.field in ('position_title', 'project_name') %}这段职位是系统根据公司名称、时间区间和名称相似度判断出来的，可能和已有记录说的是同一段经历，也可能是巧合。{% endif %}
     </p>
     <p><strong>已有：</strong>{{ c.old_value }}　<strong>新的：</strong>{{ c.new_value }}</p>
     <input type="hidden" name="kind_{{ ns.i }}" value="position_field">

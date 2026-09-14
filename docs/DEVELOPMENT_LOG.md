@@ -471,3 +471,82 @@
 `backend/app/core/paths.py`（新增）、`backend/app/core/migrate.py`、`backend/app/services/resume_pdf.py`（`AVAILABLE_RESUME_STYLES` + `app_root()`）、`backend/app/services/resume_tailor.py`（新增 `regenerate_resume_pdf`/`ResumeVersionNotFoundError`）、`backend/app/templates/resume_styles/compact.html`（新增）、`backend/app/templates/resume_tailor.html`、`backend/app/templates/resume_result.html`、`backend/app/api/routes_dashboard.py`（风格选择、`regenerate-pdf` 路由、`usage` 路由，`TEMPLATES_DIR` 改用 `app_root()`）、`backend/packaging/jobpilot.spec`（新增）、`backend/packaging/requirements-build.txt`（新增）、`backend/app/models/tables.py`（新增 `LLMUsageLog`）、`backend/alembic/versions/58f037add887_phase5_llm_usage_log.py`（新增）、`backend/app/core/llm_client.py`（`OpenAICompatibleClient.last_usage`）、`backend/app/core/llm_usage.py`（新增）、`backend/app/core/llm_factory.py`（接入 `UsageTrackingLLMClient`）、`backend/app/templates/usage.html`（新增）、`backend/app/templates/base.html`（导航新增"用量统计"）、`backend/app/main.py`（全局异常处理器）、`backend/app/templates/error.html`（新增）、`backend/tests/test_paths.py`（新增）、`backend/tests/test_llm_usage.py`（新增）、`backend/tests/test_error_handling.py`（新增）、`backend/tests/test_resume_pdf.py`、`backend/tests/test_resume_tailor.py`、`backend/tests/test_dashboard.py`、`.gitignore`（新增 `backend/build/`/`backend/dist/`）、`README.md`（新增"七、简历风格自定义""八、用量统计面板""九、打包成独立可执行文件分发"三节）
 
 ---
+
+## 打磨阶段用户反馈修复：GTK3 提权 / LLM 加载提示 / 发送按钮位置 / 职位合并模糊匹配（2026-09-14）
+
+Phase 0-5 全部完成、上线之后，用户在真实使用中反馈了几个问题，不算新 Phase，单独记一节。同一批反馈里还提出了"简历风格改成 MD 模板驱动""简历上传解析不用 LLM 改用规则解析"两项更大的改动，因为需要用户先提供默认 MD 模板文件才能确定占位符约定，这两项先搁置，等模板文件到位后再实现，本节只记已经落地的四项。
+
+### 目标
+
+1. 修复"启动本地 App 仍然报 WinError 740"——Phase 4 补充做的 GTK3 自动安装在真实 Windows 环境上并没有解决问题，反而是刚好触发了一个新的失败模式。
+2. "调用 LLM 的过程页面看起来卡住"，加一个用户能感知到的加载提示。
+3. "发送到 JobPilot"按钮有时不出现，挪到侧边栏常驻。
+4. 职位合并冲突检测目前只做精确匹配，扩展成公司精确匹配 + 时间重叠 + 标题相似度的模糊匹配，明确要求不用 LLM。
+
+### 实现内容
+
+**1. GTK3 自动安装改用 UAC 提权启动**
+
+Phase 4 补充版本的 `_run_silent_install` 用 `subprocess.run([installer_path, "/S"])` 启动 GTK3 Runtime 安装程序。这在真实 Windows 环境上会直接失败并报 `[WinError 740] 请求的操作需要提升`——GTK3 Runtime 默认装到 `C:\Program Files\`，它的安装包本身在清单里声明了需要管理员权限，而 `subprocess.run`/`CreateProcess` 这条 API 路径没有能力弹出 UAC 授权框，Windows 直接拒绝启动，连问都不问。
+
+修复思路：改用 `ctypes.windll.shell32.ShellExecuteExW` 配合 `"runas"` verb 启动安装程序——这是 Windows 上唯一能触发标准 UAC 授权对话框的方式。下载、静默安装参数（`/S`）不变，用户只需要在系统弹出的那个"是否允许此应用对你的设备进行更改"确认框里点一次"是"，这一步没有办法省略，是 Windows 的安全机制决定的（任何程序都不应该能不经用户同意就静默拿到管理员权限），不是这个模块没做好自动化。新增 `_launch_elevated_and_wait` 封装这个 ShellExecuteExW + 等待进程结束 + 取退出码的完整流程，正确区分"用户在 UAC 框里点了否"（`GetLastError() == 1223 ERROR_CANCELLED`，给一句能看懂的"授权被取消"提示）和其他启动失败/超时。
+
+`app/services/pdf_dependency_installer.py` 里定义 `_ShellExecuteInfoW` 结构体时特意只用跨平台都存在的 `ctypes` 基础类型（`c_ulong`/`c_void_p`/`c_wchar_p`/`c_int`），不用 `ctypes.wintypes`，这样这个模块在 Linux 测试环境里仍然能正常 `import`；真正会在非 Windows 平台上报错的 `ctypes.windll` 只在 `_launch_elevated_and_wait` 函数体内部被引用，只要不实际调用这个函数就不会触发 `AttributeError`——单测里对着 `_run_silent_install` 直接 monkeypatch 掉 `_launch_elevated_and_wait` 本身来验证退出码非 0/超时/UAC 取消/意外 OSError 这几个分支，不在纯 Linux 环境里真的执行任何 Windows-only 的 ctypes 调用。
+
+**2. LLM 调用加载提示（轻量方案）**
+
+给 `base.html` 加了一段通用脚本：任何表单只要带上 `data-llm-loading="提示文案"` 属性，提交时就会立刻禁用提交按钮、在表单下面插入一个带小圆圈动画（纯 CSS `@keyframes`）的提示；同样的机制也扩展到 `<a data-llm-loading="...">` 这种"点了会跳一个 GET 页面"的链接（比如"生成常见问题"）。页面整体流程完全不变——LLM 调用仍然是同步阻塞的，提交后仍然是等整页刷新展示结果，只是不会再让人以为页面卡死了。给"开始分析并打分""重新分析""生成简历草稿""深化经历追问""生成常见问题""上传简历自动建画像"这几个入口都加上了这个属性。
+
+真正做到"提交后可以离开页面、后台跑完再通知"的完整异步方案需要引入任务状态表和前端轮询，工作量大得多，这次先做轻量版，用户也确认了这个范围。
+
+**3. "发送到 JobPilot"按钮移到侧边栏**
+
+`extension/content_scripts/linkedin.js` 原来的做法是往页面右下角注入一个悬浮按钮，外加一个 `setInterval` 低频轮询把被顶掉的按钮加回来。LinkedIn 是单页应用、会频繁大范围重渲染 DOM，这种"亡羊补牢"式的兜底没办法从根上解决"按钮有时候就是不出现"的问题。
+
+改法：把这个内容脚本简化成只做一件事——监听侧边栏发来的 `jobpilot:extract-current-job` 消息，调用已经测试过的纯函数 `extractLinkedInJob` 抓取当前 DOM，把结果（或者抓不到正文的错误）返回给侧边栏。真正的按钮和状态展示挪到 `sidepanel/sidepanel.js`：侧边栏用 `chrome.tabs.query({active:true, currentWindow:true})` 检测当前激活标签页的 URL 是否匹配 `https://www.linkedin.com/jobs/*`（和 `manifest.json` 里 `content_scripts.matches` 的规则保持一致），匹配就显示"发送到 JobPilot"按钮，不匹配就显示"未检测到职位信息"；标签页切换（`chrome.tabs.onActivated`）、当前标签页导航完成（`chrome.tabs.onUpdated`）、切换窗口焦点（`chrome.windows.onFocusChanged`）、侧边栏本身从隐藏变可见（`document.visibilitychange`）都会重新检测一次。点击按钮时才真的向内容脚本发消息抓取，抓到之后复用原来就有的 `jobpilot:send-job` 后台消息管道发给本地 App，没有改动背后的鉴权/转发逻辑。
+
+这个改动顺带修复了一个原来设计上的小毛病：Phase 3 的悬浮按钮是直接注入到页面上的，不管插件有没有完成配对都会出现，点了之后才会在响应里收到"配对失败"之类的错误；现在"发送当前职位到 JobPilot"这张卡片本身就只在 `connected` 状态下才显示（复用了原来就有的 `linkedinHintCard.hidden = state.status !== "connected"` 这条逻辑），没配对的时候用户看到的直接就是配对提示卡片，根本不会看到一个点了会报错的按钮。
+
+检查了 `chrome.tabs`/`chrome.windows` 这两个新用到的命名空间要不要在 `manifest.json` 里新增权限声明——项目自己的 `scripts/check_permissions.js` 静态检查工具确认了这两个命名空间在 `tabs.query`/`tabs.sendMessage`/`tabs.create`/`windows.onFocusChanged` 这几个具体用法下不需要额外声明 `"tabs"` 权限（`tab.url` 字段的可见性由已经声明的 `host_permissions` 覆盖），所以 `manifest.json` 本身不用改。
+
+**4. 职位合并冲突检测扩展成模糊匹配**
+
+`profile_service.py` 的 `merge_parsed_experience` 原来给"职位"这一级做的是精确匹配：同一家公司下，`(标题标准化, 项目名标准化)` 这个二元组完全一致才复用已有记录，否则一律当成新职位插入。用户反馈：同公司、同时间段、标题/项目名很像的两段经历，应该被当成"很可能是同一段经历的不同措辞"去提示合并，而不是让画像里出现一堆看起来重复的职位条目。
+
+实现：精确匹配不到时，退一步在同一家公司下扫描候选，要求同时满足——(a) 起止时间有重叠，或者其中一方压根没填时间（`_date_ranges_overlap_or_missing`，按月份序数比较，"至今"当成一个足够大的数）；(b) 标题或项目名的 difflib 相似度达到阈值（`_position_similarity` 取两者较高的一个，复用贡献句去重同一套 0.82 阈值，判定口径保持一致）。两个条件都满足、且是候选里相似度最高的一个，判定为同一段职位，不新增，而是把标题/项目名的差异也纳入 `position_field_conflicts`（复用原来就有的起止时间/是否至今冲突展示，`_check_position_field_conflicts` 新增了对 `position_title`/`project_name` 两个字段的检查），交给用户在合并冲突页面确认要保留旧的还是采用新的。全程不调用 LLM——公司名+时间+标题相似度这几个信号足够靠工具确定性判断。
+
+`resolve_position_field` 放开了对 `field_name` 的校验（原来只接受 `start_date`/`end_date`/`is_current`，现在也接受 `position_title`/`project_name`），`merge_conflicts.html` 模板的字段名到中文提示的映射也相应扩展，并在展示模糊匹配出来的字段冲突时额外提示一句"这段职位是系统根据公司名称、时间区间和名称相似度判断出来的，可能是同一段经历，也可能是巧合"，避免用户误以为系统"确定"两段经历就是一回事。
+
+### 设计取舍
+
+- **UAC 确认框没办法做到完全无感**：这是本节最值得记录的一条认知修正——上一轮（Phase 4 补充）的自动安装方案在设计时低估了"GTK3 默认装到 `Program Files`，需要管理员权限"这件事对"完全静默"这个目标的影响，实际验证只在能拿到管理员权限的环境里跑通过，没有覆盖"本地 App 本身是普通权限进程"这个更常见的真实场景。这次修复过程中重新确认了一遍：Windows 不允许任何程序不经用户同意就静默提权，这是操作系统级别的安全边界，不是这个项目能绕开的实现细节，所以现在的文档和提示文案都诚实地说清楚"这一下确认省不掉"，而不是继续宣传"全自动无感安装"。
+- **模糊匹配用工具而不是 LLM**：和贡献句去重的判断标准是同一个理由——公司名、时间区间、文本相似度这几个信号已经足够确定性地判断"是不是同一段经历"，用 LLM 判断反而引入了不确定性（同样的输入可能因为模型的非确定性给出不同判断）和一次没必要的调用延迟/花费。这也是用户在这批反馈里明确提出的要求。
+- **模糊匹配的相似度取"标题、项目名两者较高的一个"而不是要求两者都达标**：现实中改写简历时经常只改其中一个字段（比如项目名从"支付平台"改成"支付平台重构"，岗位名称完全没变），要求两个字段同时达标会漏掉这种常见场景；反过来"取较高的一个"配合"时间重叠"这个前提条件，已经能有效避免把两个真的不相关的职位误判成同一个。
+- **加载提示选轻量方案、不引入后台任务队列**：见"目标"一节，用户确认了这个范围——页面整体交互流程不变，只是加一个能感知到"正在处理"的视觉反馈，性价比明显高于重新设计一套异步任务系统。
+
+### 遇到的问题与解决
+
+**问题一：ShellExecuteExW 相关的 Windows-only ctypes 调用怎么在纯 Linux 测试环境里安全地写单测**
+
+`ctypes.windll`/`ctypes.GetLastError` 这些属性在 Linux 上的 `ctypes` 模块里根本不存在（`ctypes/__init__.py` 只在 `sys.platform == "win32"` 时才定义它们），直接 `monkeypatch.setattr(ctypes, "windll", fake)` 需要 `raising=False` 才能对一个不存在的属性生效，而且这样测出来的还是"假装 windll 存在"这个前提，覆盖不到真实 Windows 上的调用约定问题。
+
+解决：把真正调用 `ctypes.windll` 的逻辑收敛进一个单独的函数 `_launch_elevated_and_wait`，`_run_silent_install` 只负责"调用它、按返回值/异常做后续处理"这一层逻辑；单测直接 monkeypatch 掉 `_launch_elevated_and_wait` 这个模块级函数本身（普通的 Python 函数替换，不涉及任何 ctypes 属性），验证 `_run_silent_install` 对"退出码非 0/超时/UAC 被取消/意外 OSError"这几种情况的处理是否正确。真正的 ShellExecuteExW 调用逻辑本身没办法在这个纯 Linux 沙盒里端到端跑通，这一点在模块文档字符串和测试文件顶部注释里都写清楚了，留给用户在自己的 Windows 机器上验证。
+
+**问题二：`company.children` 这个 SQLAlchemy 关系集合在同一次合并循环里不会自动看到刚 `db.add()` 的新职位**
+
+写模糊匹配候选扫描逻辑时，最初直接遍历 `company.children` 找候选，结果测试里"同一次上传、同一家公司下两段新职位互相模糊匹配"这种边界情况没有被正确处理——因为新职位是通过显式设置 `parent_id=company.id` 然后 `db.add()` 加进 session 的，不是通过 `company.children.append(...)` 这种会同步更新关系集合的方式，`company.children` 在同一个循环里不会自动感知到刚插入的新记录。
+
+解决：手动维护一个 `position_candidates` 列表，循环开始时从 `company.children` 初始化，每次新增一个职位就 `append` 进去，模糊匹配扫描这个手动维护的列表而不是直接读 `company.children`。这个问题目前的测试覆盖到的都是"跨两次上传"的场景（更符合真实使用习惯：不会同一份简历里同一家公司写两段几乎一样的经历），"同一次上传内部互相模糊匹配"这个边界情况理论上被这个修复覆盖了,但没有专门加测试用例去验证——如果以后发现这个场景有问题，可以从这里入手排查。
+
+### 验证结果
+
+- 后端全量跑 `backend` 目录下 pytest：**268 条用例全部通过**（对照 Phase 5 结束时的 254 条：新增 14 条——`pdf_dependency_installer` 相关测试从"monkeypatch subprocess.run"改写成"monkeypatch `_launch_elevated_and_wait`"并新增 UAC 取消场景，`test_dashboard.py` 新增 8 条加载提示属性的渲染断言，`test_profile_service.py` 新增 5 条模糊匹配场景）。
+- 插件端 `npm test`（`linkedin_parser.test.js`/`form_scanner.test.js`/`ats_selectors.test.js`）和 `npm run check-permissions` 都跑通，确认改动没有影响已经测试过的抓取/扫描逻辑，也没有引入需要额外声明的权限。
+- `node --check` 确认改过的 `sidepanel.js`/`linkedin.js` 语法没问题（jsdom 测试覆盖不到这两个文件里依赖真实 `chrome.*` API 的部分，这是这次改动里唯一没有自动化测试覆盖、需要在真实 Chrome 里手动验收的部分，已经写进 README 的验证清单）。
+- GTK3 UAC 提权、Chrome 加载提示的视觉效果、侧边栏发送按钮的真实检测行为，这三项本质上都需要真实 Windows/真实 Chrome 环境才能端到端验证，云端沙盒覆盖不到，已经写进 README 新增的"十、打磨阶段用户反馈修复"验证清单，留给用户在自己的环境里确认。
+
+### 涉及文件
+
+`backend/app/services/pdf_dependency_installer.py`（`_launch_elevated_and_wait`/`_ShellExecuteInfoW` 替换 `_run_silent_install` 原来的 `subprocess.run` 实现）、`backend/tests/test_pdf_dependency_installer.py`（对应改写）、`backend/app/templates/base.html`（新增加载提示的 CSS + 通用 JS）、`backend/app/templates/job_detail.html`、`backend/app/templates/resume_tailor.html`、`backend/app/templates/position_detail.html`、`backend/app/templates/position_interview.html`、`backend/app/templates/qa_bank.html`、`backend/app/templates/profile.html`（给对应表单/链接加 `data-llm-loading` 属性）、`backend/tests/test_dashboard.py`（新增加载提示渲染断言）、`extension/content_scripts/linkedin.js`（简化成只响应抓取消息）、`extension/sidepanel/sidepanel.html`、`extension/sidepanel/sidepanel.js`（新增侧边栏发送按钮和标签页检测逻辑）、`backend/app/services/profile_service.py`（`_date_ranges_overlap_or_missing`/`_position_similarity`/`_find_matching_position`，`_check_position_field_conflicts` 扩展 `position_title`/`project_name`，`resolve_position_field` 放开字段白名单）、`backend/app/templates/merge_conflicts.html`（字段名中文映射扩展）、`backend/tests/test_profile_service.py`（新增模糊匹配相关测试）、`README.md`（GTK3 说明更新、"五、抓取 LinkedIn 职位"更新、新增"十、打磨阶段用户反馈修复"一节）
+
+---

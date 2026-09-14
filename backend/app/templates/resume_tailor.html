@@ -7,7 +7,7 @@
 <div class="card">
   <h2>K 值：{{ k_value }}</h2>
   <p class="muted">K=0 只重排真实内容，不做技能延伸；K 越大，尝试为越多"JD 要但画像里没有真实证据"的技能生成延伸建议，但延伸建议永远需要你逐条确认才会真正进入简历。</p>
-  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor">
+  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor" data-llm-loading="AI 正在重新生成简历草稿，请稍候…">
     <label>调整 K 值重新生成草稿（0-10）</label>
     <input type="number" name="k" min="0" max="10" value="{{ k_value }}" style="width:100px; display:inline-block;">
     <button type="submit" class="secondary">重新生成草稿</button>

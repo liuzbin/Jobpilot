@@ -38,7 +38,7 @@
 
 {% if jd.status.value in ('pending',) %}
 <div class="card">
-  <form method="post" action="/dashboard/jobs/{{ jd.id }}/analyze">
+  <form method="post" action="/dashboard/jobs/{{ jd.id }}/analyze" data-llm-loading="AI 正在分析并打分，请稍候…">
     <button type="submit">开始分析并打分</button>
   </form>
   <p class="muted">需要先在"模型配置"页面填好轻量/重量两个槽位。</p>
@@ -65,7 +65,7 @@
 
   <p class="muted">打分时间 {{ score.created_at.strftime('%Y-%m-%d %H:%M') }} · 使用模型 {{ score.model_used or '-' }}</p>
 
-  <form method="post" action="/dashboard/jobs/{{ jd.id }}/analyze">
+  <form method="post" action="/dashboard/jobs/{{ jd.id }}/analyze" data-llm-loading="AI 正在重新分析并打分，请稍候…">
     <button type="submit" class="secondary">重新分析</button>
   </form>
 </div>
@@ -75,7 +75,7 @@
 <div class="card">
   <h2>生成定制简历</h2>
   <p class="muted">K 值决定"技能延伸"的幅度：K=0 只重排真实内容；K 越大，尝试为越多缺失技能生成延伸建议，但延伸建议需要你在下一步逐条确认才会真正写进简历，不会自动生效。</p>
-  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor">
+  <form method="get" action="/dashboard/jobs/{{ jd.id }}/tailor" data-llm-loading="AI 正在生成简历草稿，请稍候…">
     <label>K 值（0-10）</label>
     <input type="number" name="k" min="0" max="10" value="5" style="width:100px; display:inline-block;">
     <button type="submit">生成简历草稿</button>

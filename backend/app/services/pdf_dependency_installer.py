@@ -39,6 +39,20 @@ App 都重新走一遍下载超时+安装超时，会让"打不开 PDF 功能"�
 提示体验好多少。所以失败之后会在本地记一个时间戳，一段时间内直接跳过重试，
 只提示"之前试过、失败了、可以手动装"，把重试留给用户下次显式重启或者过了
 退避时间之后的下一次启动。
+
+为什么静默安装需要主动弹出 Windows 的管理员权限确认框（UAC），没办法做到
+完全无感：
+GTK3 Runtime 安装程序默认会装到 `C:\\Program Files\\` 这个系统目录，它的安装
+包本身在清单里就声明了"需要管理员权限"。早期版本这里用最普通的方式启动
+安装程序（相当于代码里直接 `subprocess.run`，等价于双击运行），Windows 发现
+"这个程序要管理员权限，但当前进程不是管理员"，会直接拒绝启动、报
+`WinError 740`（`ERROR_ELEVATION_REQUIRED`），连弹窗询问都不会——这是
+`CreateProcess` 系 API 的固有限制，只有 `ShellExecute` 系 API 配合 `"runas"`
+verb 才能触发标准的 UAC 授权对话框（就是那个"是否允许此应用对你的设备进行
+更改"的系统弹窗）。所以现在的做法改成用 `ShellExecuteExW` 以 `"runas"` 方式
+启动安装程序：下载和安装参数本身仍然是全自动、静默的，用户只需要在系统弹出
+的那个标准 UAC 框里点一次"是"——这一下确认没有任何办法绕开，是 Windows 自己
+的安全机制决定的，允许任何程序不经用户同意就静默提权，本身就是一个安全漏洞。
 """
 
 from __future__ import annotations
@@ -47,7 +61,6 @@ import ctypes
 import json
 import logging
 import platform
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -146,23 +159,97 @@ def _download_installer(url: str, dest_dir: Path) -> Path:
     return dest_path
 
 
+# Windows ShellExecuteExW 相关常量，用纯 ctypes 基础类型定义结构体字段（不用
+# `ctypes.wintypes`），这样这个模块在非 Windows 平台上也能正常 import——
+# 下面这些常量和结构体定义本身只是数值/内存布局声明，不涉及任何系统调用，
+# 真正会在非 Windows 平台上报错的是 `ctypes.windll`，而那只在 `_launch_
+# elevated_and_wait` 函数体内部被引用，只要不实际调用这个函数就不会触发。
+_SEE_MASK_NOCLOSEPROCESS = 0x00000040
+_SW_SHOWNORMAL = 1
+_WAIT_TIMEOUT = 0x00000102
+# ShellExecuteExW 失败时，用户在 UAC 授权框里点"否"对应的 GetLastError 值。
+_ERROR_CANCELLED = 1223
+
+
+class _ShellExecuteInfoW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("fMask", ctypes.c_ulong),
+        ("hwnd", ctypes.c_void_p),
+        ("lpVerb", ctypes.c_wchar_p),
+        ("lpFile", ctypes.c_wchar_p),
+        ("lpParameters", ctypes.c_wchar_p),
+        ("lpDirectory", ctypes.c_wchar_p),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", ctypes.c_void_p),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", ctypes.c_wchar_p),
+        ("hKeyClass", ctypes.c_void_p),
+        ("dwHotKey", ctypes.c_ulong),
+        ("hIcon", ctypes.c_void_p),
+        ("hProcess", ctypes.c_void_p),
+    ]
+
+
+def _launch_elevated_and_wait(executable_path: Path, parameters: str, timeout_seconds: int) -> int:
+    """用 UAC 弹窗以管理员身份启动 `executable_path`，同步等待进程结束并返回
+    退出码。只应该在 Windows 上被真正调用；单测里通过直接 monkeypatch 掉这个
+    函数本身来验证 `_run_silent_install` 的行为分支，不在纯 Linux 环境里真的
+    执行下面这些 Windows-only 的 ctypes 调用（模块顶部文档字符串"为什么静默
+    安装需要主动弹出 UAC"一节解释了为什么这一步没办法完全无感）。"""
+    execute_info = _ShellExecuteInfoW()
+    execute_info.cbSize = ctypes.sizeof(_ShellExecuteInfoW)
+    execute_info.fMask = _SEE_MASK_NOCLOSEPROCESS
+    execute_info.hwnd = None
+    execute_info.lpVerb = "runas"
+    execute_info.lpFile = str(executable_path)
+    execute_info.lpParameters = parameters
+    execute_info.lpDirectory = None
+    execute_info.nShow = _SW_SHOWNORMAL
+    execute_info.hInstApp = None
+    execute_info.lpIDList = None
+    execute_info.lpClass = None
+    execute_info.hKeyClass = None
+    execute_info.dwHotKey = 0
+    execute_info.hIcon = None
+    execute_info.hProcess = None
+
+    shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+    if not shell32.ShellExecuteExW(ctypes.byref(execute_info)):
+        error_code = ctypes.GetLastError()  # type: ignore[attr-defined]
+        if error_code == _ERROR_CANCELLED:
+            raise GtkAutoInstallError(
+                "需要管理员权限才能安装 GTK3 Runtime，但系统弹出的授权确认框被取消了（点了"
+                "\"否\"或直接关掉了）。"
+            )
+        raise GtkAutoInstallError(f"无法以管理员身份启动 GTK3 Runtime 安装程序（错误码 {error_code}）。")
+
+    if not execute_info.hProcess:
+        # 极少数情况下 ShellExecuteExW 报成功但没给到进程句柄，没法等待/拿
+        # 退出码，只能假定已经启动成功，不再阻塞等待安装完成。
+        return 0
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    try:
+        wait_result = kernel32.WaitForSingleObject(execute_info.hProcess, timeout_seconds * 1000)
+        if wait_result == _WAIT_TIMEOUT:
+            raise GtkAutoInstallError("GTK3 Runtime 安装程序超时（也可能是一直在等你确认 UAC 授权框）。")
+        exit_code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(execute_info.hProcess, ctypes.byref(exit_code))
+        return exit_code.value
+    finally:
+        kernel32.CloseHandle(execute_info.hProcess)
+
+
 def _run_silent_install(installer_path: Path) -> None:
     try:
-        result = subprocess.run(  # noqa: S603 - 固定来源、固定参数，非用户输入拼接
-            [str(installer_path), "/S"],
-            timeout=_INSTALL_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GtkAutoInstallError("GTK3 Runtime 静默安装超时。") from exc
+        exit_code = _launch_elevated_and_wait(installer_path, "/S", _INSTALL_TIMEOUT_SECONDS)
+    except GtkAutoInstallError:
+        raise
     except OSError as exc:
         raise GtkAutoInstallError(f"无法启动 GTK3 Runtime 安装程序：{exc}") from exc
-    if result.returncode != 0:
-        raise GtkAutoInstallError(
-            f"GTK3 Runtime 安装程序退出码非 0（{result.returncode}），"
-            "可能需要以管理员身份重新运行本地 App。"
-        )
+    if exit_code != 0:
+        raise GtkAutoInstallError(f"GTK3 Runtime 安装程序退出码非 0（{exit_code}）。")
 
 
 def auto_install_gtk_runtime() -> None:
@@ -211,7 +298,11 @@ def ensure_pdf_dependency(auto_install: bool = True) -> tuple[bool, str]:
                 f"{_MANUAL_INSTALL_URL}"
             )
 
-    logger.info("检测到缺少 PDF 渲染依赖（GTK3 Runtime），正在自动下载并静默安装……")
+    logger.info(
+        "检测到缺少 PDF 渲染依赖（GTK3 Runtime），正在自动下载……下载完成后会弹出 Windows "
+        "系统自己的管理员权限确认框（\"是否允许此应用对你的设备进行更改\"），请点\"是\"以继续"
+        "静默安装——这一步是 Windows 的安全机制决定的，没办法做到完全无感。"
+    )
     try:
         auto_install_gtk_runtime()
     except GtkAutoInstallError as exc:

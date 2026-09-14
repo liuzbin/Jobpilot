@@ -68,7 +68,7 @@
   {% else %}
     <p class="muted">还没有背景描述，点下面的按钮开始一轮追问式访谈。</p>
   {% endif %}
-  <form method="get" action="/dashboard/profile/positions/{{ position.id }}/interview">
+  <form method="get" action="/dashboard/profile/positions/{{ position.id }}/interview" data-llm-loading="AI 正在生成追问问题，请稍候…">
     <button type="submit">深化这段经历</button>
   </form>
 

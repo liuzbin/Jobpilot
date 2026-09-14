@@ -6,7 +6,7 @@
 <p class="muted">系统看了这段经历现有的信息，觉得下面这几点值得再补充一下。每个问题都可以留空跳过，答了的会被整理进"项目背景与理解"。</p>
 
 <div class="card">
-  <form method="post" action="/dashboard/profile/positions/{{ position.id }}/interview">
+  <form method="post" action="/dashboard/profile/positions/{{ position.id }}/interview" data-llm-loading="AI 正在整理项目背景描述，请稍候…">
     <input type="hidden" name="question_count" value="{{ questions|length }}">
     {% for q in questions %}
       <label>{{ loop.index }}. {{ q }}</label>
