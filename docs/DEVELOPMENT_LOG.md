@@ -550,3 +550,90 @@ Phase 4 补充版本的 `_run_silent_install` 用 `subprocess.run([installer_pat
 `backend/app/services/pdf_dependency_installer.py`（`_launch_elevated_and_wait`/`_ShellExecuteInfoW` 替换 `_run_silent_install` 原来的 `subprocess.run` 实现）、`backend/tests/test_pdf_dependency_installer.py`（对应改写）、`backend/app/templates/base.html`（新增加载提示的 CSS + 通用 JS）、`backend/app/templates/job_detail.html`、`backend/app/templates/resume_tailor.html`、`backend/app/templates/position_detail.html`、`backend/app/templates/position_interview.html`、`backend/app/templates/qa_bank.html`、`backend/app/templates/profile.html`（给对应表单/链接加 `data-llm-loading` 属性）、`backend/tests/test_dashboard.py`（新增加载提示渲染断言）、`extension/content_scripts/linkedin.js`（简化成只响应抓取消息）、`extension/sidepanel/sidepanel.html`、`extension/sidepanel/sidepanel.js`（新增侧边栏发送按钮和标签页检测逻辑）、`backend/app/services/profile_service.py`（`_date_ranges_overlap_or_missing`/`_position_similarity`/`_find_matching_position`，`_check_position_field_conflicts` 扩展 `position_title`/`project_name`，`resolve_position_field` 放开字段白名单）、`backend/app/templates/merge_conflicts.html`（字段名中文映射扩展）、`backend/tests/test_profile_service.py`（新增模糊匹配相关测试）、`README.md`（GTK3 说明更新、"五、抓取 LinkedIn 职位"更新、新增"十、打磨阶段用户反馈修复"一节）
 
 ---
+
+## 简历 MD 模板库 + 简历上传规则解析 + 静态背景信息（教育经历/独立项目/个人总结/技能）（2026-09-14）
+
+上一节记录的"打磨阶段用户反馈修复"里，用户同一批反馈还提出了两项范围更大的改动——简历风格改成完全由 MD 模板驱动、简历上传解析改成规则解析——当时因为需要先看到用户提供的默认 MD 简历模板才能定下占位符/结构约定，先搁置了。本节记录用户上传模板文件之后落地这两项改动的过程。
+
+### 目标
+
+原始反馈的两点诉求：
+
+1. 简历不需要复杂的 CSS 视觉样式，只维护两种产物——一份 Markdown 和它导出的同样式 PDF；风格差异应该体现在 MD 文本本身的排版上。用户会上传一份 MD 格式的模板作为默认简历格式，同时希望能自定义、上传更多 MD 模板，建立一个模板库。
+2. 简历上传时"LLM 在分析什么"不够透明；如果上传的是按模板格式写的简历，应该直接结构化解析存储信息，不需要走 LLM。
+
+拿到用户上传的真实简历模板文件（`Zhibin_resume-ribit.md`）之后，发现这份模板里有三块内容是当前数据模型完全没有承载的：PROFESSIONAL SUMMARY（个人总结）、TECHNICAL SKILLS（技能列表）、以及一个不挂靠任何公司的 PROJECT EXPERIENCE（独立项目）板块。这三块要不要一起做、独立项目按什么颗粒度建模、内置的 `default`/`compact` 两套 CSS 风格要不要顺带补上一直缺失的公司名+时间显示，这三个问题都会实质性改变数据库表结构和三条渲染路径共用的 `resume_json` 结构，所以编码前先用 `AskUserQuestion` 逐一跟用户确认：
+
+- 个人总结/技能要不要一起做进去 → 用户选择"一起做"，作为新的画像字段，原样写进每一版简历，不参与 JD 打分/K 值裁剪。
+- 独立项目板块怎么处理 → 用户选择"新增独立项目模块"，作为新的数据表单独管理，同样不参与打分/裁剪。
+- 内置风格要不要顺手补上公司名+时间 → 用户选择"顺手修好"。
+
+### 实现内容
+
+**1. 数据模型新增**
+
+`profile_basic` 新增 `resume_summary`/`skills_text` 两个大文本字段；新增三张表：`education_entry`（教育经历，多条）、`personal_project` + `personal_project_bullet`（独立项目及其贡献句，一对多）、`resume_template`（MD 模板库，`name`/`content`/`is_default`）；`resume_version` 新增可空外键 `resume_template_id`，指向生成这一版简历时用的模板（如果用的是内置 CSS 风格则为空）。SQLite 给已有表加外键列不能直接 `ALTER TABLE ADD CONSTRAINT`，迁移脚本里这一步改用 `op.batch_alter_table`（拷贝重建策略）并显式命名约束，方便 `downgrade()` 按名字精确删除。
+
+**2. 规则解析器 `resume_md_parser.py`**
+
+只处理 `.md` 文件，识别"个人总结/技能/工作经历/独立项目/教育经历"这几个章节的常见中英文标题变体（比如"Work Experience"和"Professional Experience"都认），用正则处理姓名/联系方式（邮箱/电话/GitHub 链接）、`**公司** | *职位*` + `<div align="right"><i>日期区间</i></div>` + 列表这种模板固定结构、"至今"/纯年份/年月这几种日期写法。一个章节标题都识别不出来时返回 `None`（不是"抽取到一半的残缺结果"），交由调用方回退到 LLM。`extract_and_structure(file_path, raw_text, llm_client)` 是这条"规则优先、LLM 兜底"路径的唯一入口：只有 `.md` 后缀才会尝试规则解析，规则解析失败或者不是 `.md`（PDF/Word/txt）一律走原有的 LLM 抽取；两条路径返回的结构完全同构，Dashboard 路由不需要关心具体走的是哪条路径。上传路由 `profile_upload_resume` 相应调整：不再无条件要求配置好轻量模型才能上传，只有真的需要走 LLM 兜底那条路径时才检查。
+
+**3. MD 模板库 `resume_template_service.py` + 独立渲染管线**
+
+`ResumeTemplate.content` 是用户自己写的 Jinja2 模板文本，`jinja2.Environment(autoescape=False, undefined=jinja2.Undefined, trim_blocks=True, lstrip_blocks=True)` 渲染成 Markdown 字符串，再用 `markdown` 库（新依赖 `markdown==3.7`）转成 HTML 片段（保留原始内嵌 HTML 不转义，因为默认模板的日期右对齐就是靠一段 `<div align="right">` 实现的），套一层固定的通用 CSS 外壳后用 WeasyPrint 转 PDF——这是和内置 `default`/`compact` 两套 CSS 风格完全独立的第二条渲染路径，`ResumeVersion.style_id` 用哨兵值 `MD_TEMPLATE_STYLE_SENTINEL = "md_template"` 标记这一版走的是模板路径。`get_or_create_default_template` 保证模板库不会是空的：首次访问"简历模板"页面时，会用一份根据用户上传的示例简历整理出来的默认模板自动播种，且始终保证有且只有一个模板被标记为默认。新增/编辑模板时会先拿一份覆盖全部字段的 sample 上下文试渲染一次，Jinja2 语法错误会被拦下来转成友好的错误提示，不会把一个渲不出来的模板存进库里，也不会因为编辑失败就把已有内容覆盖成半成品。
+
+模板作者写 `{% for item in exp.items %}` 拿贡献句列表这件事上踩过一个坑：`exp` 是普通 Python 字典时，Jinja2 对 `exp.items` 做属性访问会先命中 dict 内置的 `.items()` 方法本身，而不是取字典里 `items` 这个键——内置 `default.html`/`compact.html` 一直用的是显式的方括号写法 `position['items']` 所以不受影响，但没法要求用户自己写的模板也知道这个坑。解决办法是喂给模板的上下文干脆把这个字段改名成 `bullet_items`，从源头避免任何人踩到这个坑，模板库页面的占位符说明和内置默认模板都用的是这个新名字。
+
+**4. 静态背景信息：个人总结/技能/教育经历/独立项目**
+
+这几块内容原样写进 `resume_json` 的 `summary`/`skills`/`education`/`projects` 四个键，两条 Markdown 渲染路径（内置风格的 `_render_markdown` 和 MD 模板的 `build_template_context`）都读同一份 `resume_json`，不会因为换风格/换模板而丢失或改变内容。刻意的边界：这四块内容完全不参与 `scoring.compute_score` 的打分计算，也不参与 `resume_tailor` 里 K 值驱动的关键词命中/技能延伸判断——JD 匹配和简历重制目前只处理公司名下的工作经历，这是产品范围的有意收窄，不是遗漏。
+
+教育经历、独立项目从简历里自动识别合并时，用的是精确匹配去重（学校+学位完全一致、或者项目名完全一致才算同一条），没有像工作经历那样做 difflib 模糊相似度匹配——这两类信息条目数量通常不多，也很少出现"同一条记录被改写成不同措辞"的场景，模糊匹配的收益对不齐额外的实现和测试成本，所以先用更简单的精确匹配落地，代码注释和这里都记下了这条有意的范围收窄，以后有需要可以再补。
+
+个人总结/技能两个字段直接复用了 Phase 2 就有的 `BASIC_FIELDS`"只填空"机制（`fill_blank_profile_basic_fields`/`update_profile_basic`），不需要额外写合并逻辑：Dashboard 表单提交是覆盖，简历上传自动识别是只填空。
+
+**5. 顺手修复：内置 CSS 风格补上公司名+时间**
+
+`default.html`/`compact.html` 原来的职位标题行只显示"职位/项目名称"，完全不显示公司名称和时间区间——这是读代码时顺带发现的既有缺陷，和这次的主线改动没有直接关系，但用户确认"顺手修好"。改成一行里左边是"公司名 · 职位/项目名"、右边是时间区间（用 flexbox 布局），两套风格改法一致。
+
+**6. Dashboard 表单：`style_id` 和 `resume_template_id` 合并成一个下拉框**
+
+生成简历确认页、简历结果页的"重新生成 PDF"表单，原来只有一个 `style_id` 下拉框，现在改成 `render_choice`，用 `"style:default"`/`"template:3"` 这种带前缀的 option value 在一个下拉框里同时呈现"内置风格"和"MD 模板"两个分组。`_parse_render_choice(raw)` 只负责解析前缀、拆出 `(style_id, resume_template_id)` 二元组，不做值合法性校验——校验策略特意留给两个调用点各自决定：生成简历确认这一步选到了一个不存在的 `style_id` 就静默回退到 `default`（不应该因为一个下拉框的边界情况就让整个"生成简历"操作失败）；结果页"重新生成 PDF"这一步选到了不存在的 `style_id` 仍然像 Phase 5 那样抛 `UnknownResumeStyleError` 报错（这是用户主动点的一个动作，应该让用户感知到选错了，而不是悄悄给一个不是他选的结果）；两个调用点选到了一个已经被删除的 `resume_template_id`，都会被 `ResumeTemplateNotFoundError` 拦下来转成"选中的 MD 模板不存在了，请重新选择"这样的友好提示。
+
+### 设计取舍
+
+- **教育经历/独立项目只做精确匹配，不做模糊匹配**：和工作经历的模糊匹配（公司精确匹配+时间重叠+标题相似度）不是同一套逻辑，是有意简化——这两类信息条目少、极少出现同一条记录被改写成不同措辞后重复上传的情况，模糊匹配需要额外定义"什么算同一条教育经历/同一个项目"的相似度口径，投入产出比不划算，先用更简单可靠的精确匹配。
+- **静态背景信息完全不参与打分/K 值裁剪**：延续 Phase 2 就定下的"打分要对用户保持诚实"这条核心价值主张的边界——教育经历、独立项目、个人总结、技能这几块目前的定位是"简历里原样带出去的背景信息"，不是"可以被 JD 关键词裁剪或延伸构造"的对象；如果以后要支持独立项目也参与 JD 匹配，需要作为一次单独评估的范围扩展，不应该顺带在这次改动里模糊掉。
+- **`bullet_items` 而不是 `items`**：见上面"实现内容"第 3 点，从命名源头避免 Jinja2 的 `dict.items()` 属性遮蔽坑，比要求所有模板作者都用方括号写法更稳妥。
+- **MD 模板渲染失败会拒绝保存，不允许存一个渲不出来的模板**：`create_template`/`update_template_content` 都会先拿一份覆盖全部字段的样例上下文试渲染一次，失败就报错并且不落库/不覆盖已有内容——比"允许存一个坏模板、生成简历的时候才发现渲染失败"更早发现问题、影响范围更小。
+- **上传简历不再无条件要求配置轻量模型**：只有真的需要走 LLM 兜底那条路径（非 `.md`，或者是识别不出来章节标题的自由格式 `.md`）才检查模型是否配置好，避免一个完全不需要调用 LLM 的本地操作被一个不相关的前置检查挡住。
+
+### 遇到的问题与解决
+
+**问题一：Jinja2 对 `dict.items` 的属性访问会先命中内置方法**
+
+第一次拿真实数据渲染默认模板时，`{% for item in exp.items %}` 抛出 `TypeError: 'builtin_function_or_method' object is not iterable`——`exp` 是普通字典，Jinja2 的属性解析顺序是先 `getattr(exp, 'items')`（命中 dict 内置的 `.items()` 方法）再才尝试 `exp['items']`。内置的 `default.html`/`compact.html` 一直用方括号写法所以没暴露这个问题。解决：把喂给 MD 模板的这个字段整体改名成 `bullet_items`，从源头避免任何人（包括未来用户自己写的模板）踩到这个坑，而不是指望大家都知道要用方括号。
+
+**问题二：SQLite 不支持直接 `ALTER TABLE ADD CONSTRAINT`**
+
+`alembic revision --autogenerate` 给 `resume_version` 加外键列时生成的是一个裸的 `op.create_foreign_key(...)`，`alembic upgrade head` 跑到这一步报 `NotImplementedError: No support for ALTER of constraints in SQLite dialect`。解决：改用 `op.batch_alter_table('resume_version', schema=None)`（拷贝重建策略）包住加列+加外键这两步，并给外键约束起一个显式的名字，方便 `downgrade()` 按名字精确删除。手动验证了升级/重复升级/降级/再升级这四种情况都能正常跑通，`alembic check` 确认模型和迁移脚本完全同步。
+
+**问题三：`markdown` 库没有装**
+
+`import markdown` 报 `ModuleNotFoundError`——这是新引入的依赖，`requirements.txt` 里补上 `markdown==3.7`（版本号参照其它已固定依赖的年份选的），云端沙盒和用户设备侧的虚拟环境都手动装了一遍验证正常。
+
+**问题四：`render_choice` 的合法性校验策略如果写在公共的解析函数里会破坏两个调用点原有的不同行为**
+
+写 `_parse_render_choice` 的第一版实现时，顺手把"选到无效 `style_id` 就回退到 `default`"这条策略也塞进了这个公共解析函数里——写这一版的同时在改 `test_dashboard.py` 里断言"重新生成 PDF 选到无效风格应该报错"的用例时才意识到，这样会导致"重新生成 PDF"这个调用点也被悄悄改成静默回退，而 Phase 5 就定下的行为是这里应该报错、让用户知道自己选错了。这是编码过程中自己发现并改正的，不是等测试跑失败才发现——发现后把这条校验策略从 `_parse_render_choice` 里剥离出来，只保留"解析前缀、拆二元组"这一件事，"要不要在无效值时报错"完全交给两个调用点各自决定。
+
+### 验证结果
+
+- 后端全量跑 `backend` 目录下 pytest：**335 条用例全部通过**（对照上一节结束时的 268 条：新增 67 条——`test_resume_md_parser.py` 5 条、`test_resume_template_service.py` 14 条、`test_profile_service_static_sections.py` 20 条、`test_resume_pdf_markdown_template.py` 6 条、`test_resume_ingest.py` 4 条、`test_resume_tailor.py` 新增 5 条模板路径相关用例、`test_dashboard.py` 新增 12 条 HTTP 层用例、`test_migrations.py` 补充新表断言 1 处；另外原有 `test_dashboard.py` 里 4 条被 UI 改动破坏的用例做了针对性修复，而不是简单改字符串让它通过——其中两条顺带把"检查一个总是为真的静态文案"这种弱断言改成了真正验证"表单里正确的 option 被 selected"）。
+- 用手写的 Python 脚本对着用户上传的真实简历文件端到端验证过规则解析器和默认模板渲染，产出结果在结构和视觉上都和原始文件高度吻合。
+- 已同步到用户设备（`C:\liuzhibin\aI-agent\jobpilot`），25 个新增/改动文件用 sha256sum 逐一核对内容一致；设备侧独立的 Linux 虚拟环境里补装 `markdown==3.7` 后重新跑全量 pytest，335 条用例同样全部通过；这次改动没有涉及任何插件端文件，跳过了 `npm test`/`check-permissions`。
+
+### 涉及文件
+
+`backend/app/models/tables.py`（新增 `EducationEntry`/`PersonalProject`/`PersonalProjectBullet`/`ResumeTemplate` 四张表，`ProfileBasic` 新增 `resume_summary`/`skills_text`，`ResumeVersion` 新增 `resume_template_id`）、`backend/alembic/versions/7524cc414385_phase6_md_resume_template_and_static_.py`（新迁移脚本）、`backend/app/services/resume_md_parser.py`（新增，规则解析器）、`backend/app/services/resume_ingest.py`（`extract_and_structure` 路由逻辑）、`backend/app/services/resume_template_service.py`（新增，MD 模板库 CRUD + 渲染校验）、`backend/app/services/resume_pdf.py`（新增 MD 模板渲染管线）、`backend/app/services/resume_tailor.py`（`resume_json` 新增静态背景信息四个键，`confirm_and_finalize`/`regenerate_resume_pdf` 支持 `resume_template_id`）、`backend/app/services/profile_service.py`（教育经历/独立项目的合并+CRUD，`format_date_range`）、`backend/app/api/routes_dashboard.py`（教育经历/独立项目/MD 模板库的新路由，`render_choice` 表单字段改造）、`backend/app/templates/base.html`（导航新增"简历模板"链接）、`backend/app/templates/profile.html`（个人总结/技能表单字段，教育经历/独立项目管理卡片）、`backend/app/templates/resume_templates.html`（新增，模板库管理页面）、`backend/app/templates/resume_tailor.html`、`backend/app/templates/resume_result.html`（`render_choice` 下拉框改造）、`backend/app/templates/resume_styles/default.html`、`backend/app/templates/resume_styles/compact.html`（补上公司名+时间显示）、`backend/app/templates/resume_styles/_markdown_generic.html`（新增，MD 模板渲染的通用 CSS 外壳）、`backend/requirements.txt`（新增 `markdown==3.7`）、对应的六个新测试文件和两个既有测试文件的针对性修复（见"验证结果"）、`README.md`（新增"十一、简历 MD 模板库 + 简历上传规则解析"一节）、`docs/JobPilot_实施方案.md`（版本号更新，数据模型/模块设计/分阶段实施计划/风险清单同步）。
+
+---

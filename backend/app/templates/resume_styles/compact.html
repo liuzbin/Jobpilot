@@ -51,9 +51,20 @@
     margin-bottom: 2.5mm;
     break-inside: avoid;
   }
+  .position-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 3mm;
+  }
   .position-header {
     font-weight: bold;
     font-size: 9.5pt;
+  }
+  .position-dates {
+    font-size: 8.5pt;
+    color: #666;
+    white-space: nowrap;
   }
   .bullet-line {
     margin: 0.3mm 0 0.3mm 3mm;
@@ -74,13 +85,16 @@
     {% if resume.basic.target_title %}
     <p class="target-title">{{ resume.basic.target_title }}</p>
     {% endif %}
-    <p class="contact">{{ [resume.basic.email, resume.basic.phone] | select | join(" · ") }}</p>
+    <p class="contact">{{ [resume.basic.current_location, resume.basic.email, resume.basic.phone, resume.basic.github_url, resume.basic.linkedin_url] | select | join(" · ") }}</p>
   </div>
 
   <h2>工作经历</h2>
   {% for position in resume.experience %}
     <div class="position-block">
-      <div class="position-header">{{ [position.position_title, position.project_name] | select | join(" / ") }}</div>
+      <div class="position-row">
+        <span class="position-header">{{ [position.company_name, ([position.position_title, position.project_name] | select | join(" / "))] | select | join(" · ") }}</span>
+        {% if position.date_range %}<span class="position-dates">{{ position.date_range }}</span>{% endif %}
+      </div>
       {% for item in position['items'] %}
         <div class="bullet-line">{{ item.action_summary }}{% if item.result_summary %}，{{ item.result_summary }}{% endif %}</div>
       {% endfor %}

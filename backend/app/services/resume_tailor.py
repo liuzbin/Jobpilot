@@ -40,12 +40,27 @@ from app.models.tables import (
     ExperienceEntry,
     ExperienceLevel,
     JDRecord,
-    ProfileBasic,
     ResumeVersion,
 )
 from app.services.jd_ingest import structure_jd_text
-from app.services.profile_service import get_or_create_profile_basic
-from app.services.resume_pdf import AVAILABLE_RESUME_STYLES, UnknownResumeStyleError, save_resume_pdf
+from app.services.profile_service import (
+    format_date_range,
+    get_or_create_profile_basic,
+    get_personal_projects,
+)
+from app.services.profile_service import get_education_entries as _get_education_entries
+from app.services.resume_pdf import (
+    AVAILABLE_RESUME_STYLES,
+    MD_TEMPLATE_STYLE_SENTINEL,
+    UnknownResumeStyleError,
+    save_markdown_resume_pdf,
+    save_resume_pdf,
+)
+from app.services.resume_template_service import (
+    ResumeTemplateNotFoundError,
+    get_template as get_resume_template,
+    render_template_markdown,
+)
 
 logger = logging.getLogger("jobpilot")
 
@@ -519,20 +534,157 @@ def _upsert_claimed_skill(db: Session, suggestion: dict, jd_id: int) -> ClaimedS
     return existing
 
 
-def _render_markdown(profile: ProfileBasic, items_by_position: dict) -> str:
-    lines = [f"# {profile.full_name or '（未填写姓名）'}"]
-    if profile.target_title:
-        lines.append(f"**{profile.target_title}**")
+def _split_lines(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _build_static_sections(db: Session) -> tuple[list[dict], list[dict]]:
+    """独立项目 / 教育经历这两块"静态背景信息"——见 profile_service.py 里
+    PersonalProject/EducationEntry 的说明，不参与 JD 关键词匹配/K 值裁剪，
+    每次生成简历都原样带上全部内容。"""
+    projects = [
+        {
+            "project_name": p.project_name,
+            "start_date": p.start_date,
+            "end_date": p.end_date,
+            "is_current": p.is_current,
+            "date_range": format_date_range(p.start_date, p.end_date, p.is_current),
+            "bullets": [b.content for b in sorted(p.bullets, key=lambda b: (b.order_index, b.id))],
+        }
+        for p in get_personal_projects(db)
+    ]
+    education = [
+        {
+            "school": e.school,
+            "degree": e.degree,
+            "location": e.location,
+            "start_date": e.start_date,
+            "end_date": e.end_date,
+            "is_current": e.is_current,
+            "date_range": format_date_range(e.start_date, e.end_date, e.is_current),
+        }
+        for e in _get_education_entries(db)
+    ]
+    return projects, education
+
+
+def build_template_context(resume_json: dict) -> dict:
+    """把 resume_json（内置 default/compact 两套风格也在用的结构）转换成
+    喂给 MD 模板的上下文——两者字段大部分同名，唯一的差异是工作经历下的
+    贡献句列表这里改叫 `bullet_items` 而不是 `items`：Jinja2 对 `foo.items`
+    做属性访问时会先命中 dict 内置的 `.items()` 方法、而不是取字典里那个
+    键（`foo['items']` 才会命中），default.html/compact.html 里全部用的是
+    显式的方括号取法所以不受影响，但没法要求用户自定义的 MD 模板也知道
+    这个坑，所以这里的上下文干脆换一个不会撞到内置方法名的字段名，从源头
+    避免这个问题（resume_template_service.py 模块文档字符串同步记了这一点）。
+    """
+    experience = [
+        {
+            "company_name": position.get("company_name"),
+            "position_title": position.get("position_title"),
+            "project_name": position.get("project_name"),
+            "date_range": position.get("date_range"),
+            "bullet_items": position.get("items", []),
+        }
+        for position in resume_json.get("experience", [])
+    ]
+    projects = [
+        {
+            "project_name": project.get("project_name"),
+            "date_range": project.get("date_range"),
+            "bullets": project.get("bullets", []),
+        }
+        for project in resume_json.get("projects", [])
+    ]
+    education = [
+        {
+            "school": edu.get("school"),
+            "degree": edu.get("degree"),
+            "location": edu.get("location"),
+            "date_range": edu.get("date_range"),
+        }
+        for edu in resume_json.get("education", [])
+    ]
+    return {
+        "basic": resume_json.get("basic") or {},
+        "summary": resume_json.get("summary") or [],
+        "skills": resume_json.get("skills") or [],
+        "experience": experience,
+        "projects": projects,
+        "education": education,
+    }
+
+
+def _render_markdown(resume_json: dict) -> str:
+    """内置 default/compact 两套风格用的固定 Markdown 渲染——纯函数，只依赖
+    `resume_json`（不再依赖调用方手上的 profile/items_by_position 这些活的
+    ORM 对象），这样 `regenerate_resume_pdf` 换风格时也能拿已经持久化的
+    `resume_json` 重新算出完全一样的 markdown_text，不用重新查一遍数据库、
+    也不用把 ORM 对象一路传下来。
+
+    和 MD 模板路径（build_template_context + resume_template_service.render_template_markdown）
+    是两条独立但读同一份 resume_json 的渲染路径——这里的排版是固定写死的，
+    不像 MD 模板那样可以自定义，含义上相当于"内置的默认 MD 模板"。"""
+    basic = resume_json.get("basic") or {}
+    lines = [f"# {basic.get('full_name') or '（未填写姓名）'}"]
+    if basic.get("target_title"):
+        lines.append(f"**{basic['target_title']}**")
+    contact_bits = [
+        b
+        for b in [basic.get("current_location"), basic.get("email"), basic.get("phone"), basic.get("github_url"), basic.get("linkedin_url")]
+        if b
+    ]
+    if contact_bits:
+        lines.append(" · ".join(contact_bits))
     lines.append("")
+
+    summary = resume_json.get("summary") or []
+    if summary:
+        lines.append("## 个人总结")
+        lines.extend(f"- {line}" for line in summary)
+        lines.append("")
+
+    skills = resume_json.get("skills") or []
+    if skills:
+        lines.append("## 技能")
+        lines.extend(f"- {line}" for line in skills)
+        lines.append("")
+
     lines.append("## 工作经历")
-    for position, items in items_by_position.items():
-        header = " / ".join(filter(None, [position.position_title, position.project_name]))
-        lines.append(f"\n### {header}")
-        for item in items:
+    experience = resume_json.get("experience") or []
+    if not experience:
+        lines.append("（本版本没有命中任何真实经历或已确认的延伸建议）")
+    for position in experience:
+        header_bits = [b for b in [position.get("company_name"), position.get("position_title") or position.get("project_name")] if b]
+        header = " · ".join(header_bits) or "（未命名职位）"
+        date_range = position.get("date_range")
+        lines.append(f"\n### {header}" + (f"（{date_range}）" if date_range else ""))
+        for item in position.get("items", []):
             bullet_line = f"- {item['action_summary']}"
             if item.get("result_summary"):
                 bullet_line += f"，{item['result_summary']}"
             lines.append(bullet_line)
+
+    projects = resume_json.get("projects") or []
+    if projects:
+        lines.append("\n## 独立项目")
+        for project in projects:
+            date_range = project.get("date_range")
+            lines.append(f"\n### {project.get('project_name')}" + (f"（{date_range}）" if date_range else ""))
+            for bullet in project.get("bullets", []):
+                lines.append(f"- {bullet}")
+
+    education = resume_json.get("education") or []
+    if education:
+        lines.append("\n## 教育背景")
+        for edu in education:
+            header_bits = [b for b in [edu.get("school"), edu.get("degree")] if b]
+            header = " · ".join(header_bits)
+            date_range = edu.get("date_range")
+            lines.append(f"- {header}" + (f"（{date_range}）" if date_range else ""))
+
     return "\n".join(lines)
 
 
@@ -543,6 +695,7 @@ def confirm_and_finalize(
     hit_items: list[dict],
     accepted_suggestions: list[dict],
     style_id: str = "default",
+    resume_template_id: int | None = None,
 ) -> ResumeVersion:
     """用户对 `build_resume_draft` 产出的建议逐条确认之后调用。`accepted_suggestions`
     只包含用户接受的那些（可能已经被用户编辑过 action_summary/result_summary），
@@ -551,11 +704,21 @@ def confirm_and_finalize(
     确认过的每一条会被持久化进 claimed_skill（同一项目下同一个技能名再次确认时
     是更新而不是重复插入），但这个持久化和打分引擎完全无关——compute_score
     不读 claimed_skill 这张表。
+
+    `resume_template_id` 非空时代表用户这次选的是 MD 模板库里的某个模板，
+    而不是内置的 default/compact 风格——这时 `style_id` 参数被忽略，
+    最终存进去的 `style_id` 恒为 `resume_pdf.MD_TEMPLATE_STYLE_SENTINEL`（见
+    该模块文档字符串）。两条路径共用同一份 `resume_json` 构建逻辑,只是
+    markdown_text/PDF 的渲染方式不同——模板不存在会在这里提前抛
+    `resume_template_service.ResumeTemplateNotFoundError`,不会插入一半
+    的 `resume_version`。
     """
     jd = db.get(JDRecord, jd_id)
     if jd is None:
         raise JDNotFoundError(f"JD id={jd_id} 不存在")
     profile = get_or_create_profile_basic(db)
+
+    template = get_resume_template(db, resume_template_id) if resume_template_id is not None else None
 
     position_ids = {item["experience_entry_id"] for item in [*hit_items, *accepted_suggestions]}
     positions = {
@@ -584,28 +747,48 @@ def confirm_and_finalize(
             }
         )
 
+    projects, education = _build_static_sections(db)
     resume_json = {
         "basic": {
             "full_name": profile.full_name,
             "target_title": profile.target_title,
             "email": profile.email,
             "phone": profile.phone,
+            "current_location": profile.current_location,
+            "github_url": profile.github_url,
+            "linkedin_url": profile.linkedin_url,
         },
+        "summary": _split_lines(profile.resume_summary),
+        "skills": _split_lines(profile.skills_text),
         "experience": [
             {
+                "company_name": position.parent.company_name if position.parent else None,
                 "position_title": position.position_title,
                 "project_name": position.project_name,
+                "start_date": position.start_date,
+                "end_date": position.end_date,
+                "is_current": position.is_current,
+                "date_range": format_date_range(position.start_date, position.end_date, position.is_current),
                 "items": items,
             }
             for position, items in items_by_position.items()
         ],
+        "projects": projects,
+        "education": education,
     }
-    markdown_text = _render_markdown(profile, items_by_position)
+
+    if template is not None:
+        markdown_text = render_template_markdown(template.content, build_template_context(resume_json))
+        stored_style_id = MD_TEMPLATE_STYLE_SENTINEL
+    else:
+        markdown_text = _render_markdown(resume_json)
+        stored_style_id = style_id
 
     resume_version = ResumeVersion(
         jd_id=jd_id,
         k_value=k_value,
-        style_id=style_id,
+        style_id=stored_style_id,
+        resume_template_id=template.id if template is not None else None,
         resume_json=resume_json,
         markdown_text=markdown_text,
         pdf_path=None,
@@ -619,7 +802,10 @@ def confirm_and_finalize(
     # Markdown/JSON 才是事实来源，PDF 只是它的一种展示形式，缺了它用户仍然
     # 能拿到完整可用的简历内容,只是没有 PDF 下载链接。
     try:
-        pdf_path = save_resume_pdf(resume_version.id, resume_json, style_id)
+        if template is not None:
+            pdf_path = save_markdown_resume_pdf(resume_version.id, markdown_text)
+        else:
+            pdf_path = save_resume_pdf(resume_version.id, resume_json, style_id)
         resume_version.pdf_path = str(pdf_path)
         db.commit()
         db.refresh(resume_version)
@@ -633,31 +819,53 @@ def confirm_and_finalize(
 # ---------- Phase 5：简历风格自定义——换个风格重新渲染 PDF，不重新走 LLM ----------
 
 
-def regenerate_resume_pdf(db: Session, resume_version_id: int, style_id: str) -> ResumeVersion:
-    """已经生成过的简历版本，用户想换一套风格看看效果，不需要重新走一遍
-    K 值/延伸建议确认这套完整流程——`resume_json` 已经是持久化好的事实来源，
-    换风格只是用不同的 Jinja2 模板把同一份内容重新排一次版，属于纯本地
-    渲染，不消耗任何 LLM 调用，所以允许用户随便换着试。
+def regenerate_resume_pdf(
+    db: Session, resume_version_id: int, style_id: str | None = None, resume_template_id: int | None = None
+) -> ResumeVersion:
+    """已经生成过的简历版本，用户想换一套风格/模板看看效果，不需要重新走
+    一遍 K 值/延伸建议确认这套完整流程——`resume_json` 已经是持久化好的
+    事实来源，换风格只是把同一份内容重新渲染一次，属于纯本地渲染，不消耗
+    任何 LLM 调用，所以允许用户随便换着试。`style_id`/`resume_template_id`
+    互斥，传哪个就走哪条路径（都不传按 style_id="default" 处理）。
 
-    只更新 `style_id` 和 `pdf_path`，`resume_json`/`markdown_text` 完全不动。
+    `markdown_text` 每次都会跟着重新算一遍（`_render_markdown`/
+    `render_template_markdown` 都是只读 `resume_json` 的纯函数），不是
+    "只有换模板才更新"——这不代表在 default/compact 两个内置风格之间切换
+    会改变 markdown_text 的内容：`resume_json` 没变,`_render_markdown` 对
+    同样的输入必然算出同样的输出,纯函数意义上和"完全不碰 markdown_text"
+    是等价的,但换成 MD 模板（或者换一个不同的 MD 模板）确实会让
+    markdown_text 变成模板渲染出来的新内容,这是有意的——模板本身就是在
+    决定"这份简历的 Markdown 应该长什么样"。
 
     这里故意不像 `confirm_and_finalize` 那样自己吞掉 PDF 渲染失败的异常：
     那边"生成简历"是一个更大的操作,PDF 只是附带产物,失败了不该拖累整个
     确认流程;这里"换个风格重新生成 PDF"本身就是用户点的这一个动作、没有
     更大的操作需要保护,失败了应该让调用方（Dashboard 路由）感知到并提示
-    用户,而不是静默地什么都没发生。异常在 `save_resume_pdf` 这一步抛出时,
-    下面两行赋值根本不会执行,所以旧的 `style_id`/`pdf_path` 会保持原样——
-    不会因为一次失败的"换风格"尝试,把用户已经拥有的、能正常下载的旧 PDF
-    意外弄丢。
+    用户,而不是静默地什么都没发生。异常抛出时下面的赋值根本不会执行,
+    所以旧的 `style_id`/`pdf_path`/`markdown_text` 会保持原样——不会因为
+    一次失败的"换风格"尝试,把用户已经拥有的、能正常下载的旧 PDF 意外弄丢。
     """
     resume_version = db.get(ResumeVersion, resume_version_id)
     if resume_version is None:
         raise ResumeVersionNotFoundError(f"resume_version id={resume_version_id} 不存在")
-    if style_id not in AVAILABLE_RESUME_STYLES:
-        raise UnknownResumeStyleError(f"未知的简历风格：{style_id}")
+    resume_json = resume_version.resume_json or {}
 
-    pdf_path = save_resume_pdf(resume_version.id, resume_version.resume_json or {}, style_id)
-    resume_version.style_id = style_id
+    if resume_template_id is not None:
+        template = get_resume_template(db, resume_template_id)  # 不存在会抛 ResumeTemplateNotFoundError
+        markdown_text = render_template_markdown(template.content, build_template_context(resume_json))
+        pdf_path = save_markdown_resume_pdf(resume_version.id, markdown_text)
+        resume_version.style_id = MD_TEMPLATE_STYLE_SENTINEL
+        resume_version.resume_template_id = template.id
+    else:
+        style_id = style_id or "default"
+        if style_id not in AVAILABLE_RESUME_STYLES:
+            raise UnknownResumeStyleError(f"未知的简历风格：{style_id}")
+        markdown_text = _render_markdown(resume_json)
+        pdf_path = save_resume_pdf(resume_version.id, resume_json, style_id)
+        resume_version.style_id = style_id
+        resume_version.resume_template_id = None
+
+    resume_version.markdown_text = markdown_text
     resume_version.pdf_path = str(pdf_path)
     db.commit()
     db.refresh(resume_version)

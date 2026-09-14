@@ -526,6 +526,132 @@ def test_regenerate_resume_pdf_propagates_failure_and_keeps_old_state(db_session
 # ---------- 回归测试：认领技能库不影响打分引擎 ----------
 
 
+# ---------- 打磨阶段用户反馈第 1 点：MD 模板驱动的渲染路径 ----------
+
+
+def test_confirm_and_finalize_with_resume_template_id_renders_via_template(db_session):
+    from app.services.resume_pdf import MD_TEMPLATE_STYLE_SENTINEL
+    from app.services.resume_template_service import create_template
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+
+    template = create_template(
+        db_session,
+        "我的自定义模板",
+        "# {{ basic.full_name }}\n\n{% for exp in experience %}## {{ exp.company_name }}\n{% for b in exp.bullet_items %}- {{ b.action_summary }}\n{% endfor %}{% endfor %}",
+    )
+
+    resume_version = confirm_and_finalize(
+        db_session, jd.id, 5, hit_items, [], style_id="default", resume_template_id=template.id
+    )
+
+    assert resume_version.style_id == MD_TEMPLATE_STYLE_SENTINEL
+    assert resume_version.resume_template_id == template.id
+    assert "## Acme Corp" in resume_version.markdown_text
+    assert "Built ETL pipeline" in resume_version.markdown_text
+    from pathlib import Path
+
+    assert resume_version.pdf_path is not None
+    assert Path(resume_version.pdf_path).read_bytes()[:4] == b"%PDF"
+
+
+def test_confirm_and_finalize_unknown_resume_template_id_raises_before_inserting(db_session):
+    from app.services.resume_template_service import ResumeTemplateNotFoundError
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+
+    with pytest.raises(ResumeTemplateNotFoundError):
+        confirm_and_finalize(db_session, jd.id, 5, hit_items, [], resume_template_id=9999)
+
+    from app.models.tables import ResumeVersion
+
+    assert db_session.query(ResumeVersion).count() == 0
+
+
+def test_regenerate_resume_pdf_switches_from_style_to_template_and_back(db_session):
+    from pathlib import Path
+
+    from app.services.resume_pdf import MD_TEMPLATE_STYLE_SENTINEL
+    from app.services.resume_tailor import regenerate_resume_pdf
+    from app.services.resume_template_service import create_template
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [], style_id="default")
+    original_markdown = resume_version.markdown_text
+
+    template = create_template(db_session, "模板", "# {{ basic.full_name }}\n\n自定义内容")
+    updated = regenerate_resume_pdf(db_session, resume_version.id, resume_template_id=template.id)
+
+    assert updated.style_id == MD_TEMPLATE_STYLE_SENTINEL
+    assert updated.resume_template_id == template.id
+    assert updated.markdown_text != original_markdown  # 换成模板渲染出来的新内容
+    assert "自定义内容" in updated.markdown_text
+    assert Path(updated.pdf_path).read_bytes()[:4] == b"%PDF"
+
+    # 切回内置风格：resume_template_id 应该被清空，markdown_text 恢复成
+    # _render_markdown(resume_json) 的结果（和最开始一致，因为 resume_json 没变过）。
+    back = regenerate_resume_pdf(db_session, resume_version.id, style_id="compact")
+    assert back.style_id == "compact"
+    assert back.resume_template_id is None
+    assert back.markdown_text == original_markdown
+
+
+def test_regenerate_resume_pdf_unknown_template_id_raises_and_keeps_old_state(db_session):
+    from app.services.resume_template_service import ResumeTemplateNotFoundError
+    from app.services.resume_tailor import regenerate_resume_pdf
+
+    position_id = _seed_experience(db_session)
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 5, hit_items, [], style_id="default")
+    original_style_id = resume_version.style_id
+    original_pdf_path = resume_version.pdf_path
+
+    with pytest.raises(ResumeTemplateNotFoundError):
+        regenerate_resume_pdf(db_session, resume_version.id, resume_template_id=9999)
+
+    db_session.refresh(resume_version)
+    assert resume_version.style_id == original_style_id
+    assert resume_version.pdf_path == original_pdf_path
+
+
+def test_confirm_and_finalize_includes_static_sections_in_resume_json(db_session):
+    """个人总结/技能/教育经历/独立项目这些"静态背景信息"应该原样进
+    resume_json，且不受 K 值/关键词命中逻辑影响。"""
+    from app.services.profile_service import (
+        add_education_entry,
+        add_personal_project,
+        add_personal_project_bullet,
+        update_profile_basic,
+    )
+
+    position_id = _seed_experience(db_session)
+    update_profile_basic(db_session, {"resume_summary": "Line one\nLine two", "skills_text": "Python, Go"})
+    add_education_entry(db_session, "MIT", degree="BSc")
+    project = add_personal_project(db_session, "Side Bot")
+    add_personal_project_bullet(db_session, project.id, "Built a thing")
+
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Hadoop experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+
+    resume_version = confirm_and_finalize(db_session, jd.id, 0, hit_items, [])
+
+    resume_json = resume_version.resume_json
+    assert resume_json["summary"] == ["Line one", "Line two"]
+    assert resume_json["skills"] == ["Python, Go"]
+    assert resume_json["education"][0]["school"] == "MIT"
+    assert resume_json["projects"][0]["project_name"] == "Side Bot"
+    assert resume_json["projects"][0]["bullets"] == ["Built a thing"]
+    assert "Line one" in resume_version.markdown_text
+    assert "Side Bot" in resume_version.markdown_text
+
+
 def test_claimed_skill_does_not_affect_scoring(db_session):
     position_id = _seed_experience(db_session)
     update_profile_basic(db_session, {"years_experience": 3.0, "education": "Bachelor's degree"})

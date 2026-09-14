@@ -19,6 +19,10 @@ EXPECTED_TABLES = {
     "resume_version",
     "qa_bank",
     "model_config",
+    "education_entry",
+    "personal_project",
+    "personal_project_bullet",
+    "resume_template",
 }
 
 

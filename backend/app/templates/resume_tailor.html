@@ -56,12 +56,22 @@
 
   <div class="card">
     <h2>简历风格</h2>
-    <label>选择排版风格（生成之后也可以在结果页随时换一套重新生成 PDF，不需要重新走这个流程）</label>
-    <select name="style_id">
-      {% for sid, label in available_styles.items() %}
-        <option value="{{ sid }}">{{ label }}</option>
-      {% endfor %}
+    <label>选择排版风格（内置风格 = CSS 排版；MD 模板 = 按你的 Markdown 模板渲染，生成之后也可以在结果页随时换一套重新生成，不需要重新走这个流程）</label>
+    <select name="render_choice">
+      <optgroup label="内置风格">
+        {% for sid, label in available_styles.items() %}
+          <option value="style:{{ sid }}">{{ label }}</option>
+        {% endfor %}
+      </optgroup>
+      {% if resume_templates %}
+      <optgroup label="MD 模板">
+        {% for tpl in resume_templates %}
+          <option value="template:{{ tpl.id }}">{{ tpl.name }}{% if tpl.is_default %}（默认）{% endif %}</option>
+        {% endfor %}
+      </optgroup>
+      {% endif %}
     </select>
+    <p class="muted" style="font-size:12px;">MD 模板可以在<a href="/dashboard/resume-templates">简历模板</a>页面新增/编辑。</p>
   </div>
 
   <div class="card">

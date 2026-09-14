@@ -629,7 +629,7 @@ def test_tailor_draft_page_includes_style_selector():
             app.dependency_overrides.pop(get_heavy_client, None)
 
         assert r.status_code == 200
-        assert '<select name="style_id">' in r.text
+        assert '<select name="render_choice">' in r.text
         assert "默认（简洁单栏）" in r.text
         assert "紧凑（更小间距，适合内容较多）" in r.text
 
@@ -641,15 +641,15 @@ def test_tailor_confirm_respects_selected_style():
 
         confirm = client.post(
             f"{jd_url}/tailor/confirm",
-            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "compact"},
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "render_choice": "style:compact"},
             follow_redirects=True,
         )
         assert confirm.status_code == 200
-        assert "紧凑（更小间距，适合内容较多）" in confirm.text
+        assert 'value="style:compact" selected' in confirm.text
 
 
 def test_tailor_confirm_falls_back_to_default_style_on_bogus_value():
-    """表单被篡改提交了一个不在 AVAILABLE_RESUME_STYLES 里的 style_id 时，
+    """表单被篡改提交了一个不在 AVAILABLE_RESUME_STYLES 里的风格值时，
     应该悄悄回退到 default，而不是让整个"生成简历"操作报错。"""
     with _client() as client:
         _seed_position_via_upload(client)
@@ -661,13 +661,13 @@ def test_tailor_confirm_falls_back_to_default_style_on_bogus_value():
                 "k_value": "0",
                 "hit_items_json": "[]",
                 "suggestion_count": "0",
-                "style_id": "no-such-style",
+                "render_choice": "style:no-such-style",
             },
             follow_redirects=True,
         )
         assert confirm.status_code == 200
         assert "简历已生成" in confirm.text
-        assert "默认（简洁单栏）" in confirm.text
+        assert 'value="style:default" selected' in confirm.text
 
 
 def test_resume_regenerate_pdf_switches_style_and_flashes_success():
@@ -676,22 +676,24 @@ def test_resume_regenerate_pdf_switches_style_and_flashes_success():
         jd_url = _seed_jd_with_score(client)
         confirm = client.post(
             f"{jd_url}/tailor/confirm",
-            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "default"},
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "render_choice": "style:default"},
             follow_redirects=True,
         )
         result_url = confirm.url.path
 
-        regenerate = client.post(f"{result_url}/regenerate-pdf", data={"style_id": "compact"}, follow_redirects=True)
+        regenerate = client.post(
+            f"{result_url}/regenerate-pdf", data={"render_choice": "style:compact"}, follow_redirects=True
+        )
         assert regenerate.status_code == 200
-        assert "已按新风格重新生成 PDF" in regenerate.text
-        assert "紧凑（更小间距，适合内容较多）" in regenerate.text
+        assert "已按新风格/模板重新生成" in regenerate.text
+        assert 'value="style:compact" selected' in regenerate.text
 
 
 def test_resume_regenerate_pdf_missing_version_returns_404():
     with _client() as client:
         jd_url = _seed_jd_with_score(client)
         resume_id = 99999
-        r = client.post(f"{jd_url}/resumes/{resume_id}/regenerate-pdf", data={"style_id": "compact"})
+        r = client.post(f"{jd_url}/resumes/{resume_id}/regenerate-pdf", data={"render_choice": "style:compact"})
         assert r.status_code == 404
 
 
@@ -701,13 +703,13 @@ def test_resume_regenerate_pdf_unknown_style_shows_friendly_flash_error():
         jd_url = _seed_jd_with_score(client)
         confirm = client.post(
             f"{jd_url}/tailor/confirm",
-            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "style_id": "default"},
+            data={"k_value": "0", "hit_items_json": "[]", "suggestion_count": "0", "render_choice": "style:default"},
             follow_redirects=True,
         )
         result_url = confirm.url.path
 
         regenerate = client.post(
-            f"{result_url}/regenerate-pdf", data={"style_id": "no-such-style"}, follow_redirects=True
+            f"{result_url}/regenerate-pdf", data={"render_choice": "style:no-such-style"}, follow_redirects=True
         )
         assert regenerate.status_code == 200
         assert "未知的简历风格" in regenerate.text
@@ -1219,3 +1221,247 @@ def test_tailor_regenerate_draft_form_has_llm_loading_hint():
             app.dependency_overrides.pop(get_heavy_client, None)
         assert r.status_code == 200
         assert 'data-llm-loading="AI 正在重新生成简历草稿，请稍候…"' in r.text
+
+
+# ---------- 打磨阶段后新增：教育经历 / 独立项目 / MD 模板库路由 ----------
+
+
+def test_profile_add_update_delete_education_entry():
+    with _client() as client:
+        add = client.post(
+            "/dashboard/profile/education",
+            data={"school": "MIT", "degree": "BSc", "location": "Cambridge", "start_date": "2016-09", "end_date": "2020-06"},
+            follow_redirects=True,
+        )
+        assert add.status_code == 200
+        assert "已新增教育经历" in add.text
+        assert "MIT" in add.text
+
+        match = re.search(r"/dashboard/profile/education/(\d+)/delete", add.text)
+        assert match, "没有在画像页面找到教育经历的删除链接"
+        entry_id = int(match.group(1))
+
+        update = client.post(
+            f"/dashboard/profile/education/{entry_id}/update",
+            data={"school": "MIT", "degree": "MSc", "location": "Cambridge"},
+            follow_redirects=True,
+        )
+        assert update.status_code == 200
+        assert "已更新教育经历" in update.text
+        assert "MSc" in update.text
+
+        delete = client.post(f"/dashboard/profile/education/{entry_id}/delete", follow_redirects=True)
+        assert delete.status_code == 200
+        assert "已删除教育经历" in delete.text
+        assert "MIT" not in delete.text
+
+
+def test_profile_add_education_requires_school():
+    with _client() as client:
+        r = client.post("/dashboard/profile/education", data={"school": ""}, follow_redirects=True)
+        assert r.status_code == 200
+        assert 'class="flash error"' in r.text
+
+
+def test_profile_update_education_missing_id_returns_404():
+    with _client() as client:
+        r = client.post("/dashboard/profile/education/9999/update", data={"school": "X"})
+        assert r.status_code == 404
+
+
+def test_profile_add_project_with_bullet_then_delete():
+    with _client() as client:
+        add = client.post(
+            "/dashboard/profile/projects",
+            data={"project_name": "Side Bot", "start_date": "2023"},
+            follow_redirects=True,
+        )
+        assert add.status_code == 200
+        assert "已新增独立项目" in add.text
+        assert "Side Bot" in add.text
+
+        match = re.search(r"/dashboard/profile/projects/(\d+)/delete", add.text)
+        assert match, "没有在画像页面找到独立项目的删除链接"
+        project_id = int(match.group(1))
+
+        bullet_add = client.post(
+            f"/dashboard/profile/projects/{project_id}/bullets",
+            data={"content": "Built a thing"},
+            follow_redirects=True,
+        )
+        assert bullet_add.status_code == 200
+        assert "已新增项目贡献句" in bullet_add.text
+        assert "Built a thing" in bullet_add.text
+
+        bullet_match = re.search(r"/dashboard/profile/project-bullets/(\d+)/delete", bullet_add.text)
+        assert bullet_match, "没有在画像页面找到项目贡献句的删除链接"
+        bullet_id = int(bullet_match.group(1))
+
+        bullet_delete = client.post(f"/dashboard/profile/project-bullets/{bullet_id}/delete", follow_redirects=True)
+        assert bullet_delete.status_code == 200
+        assert "Built a thing" not in bullet_delete.text
+
+        project_delete = client.post(f"/dashboard/profile/projects/{project_id}/delete", follow_redirects=True)
+        assert project_delete.status_code == 200
+        assert "已删除独立项目" in project_delete.text
+        assert "Side Bot" not in project_delete.text
+
+
+def test_profile_update_project_missing_id_returns_404():
+    with _client() as client:
+        r = client.post("/dashboard/profile/projects/9999/update", data={"project_name": "X"})
+        assert r.status_code == 404
+
+
+def test_resume_templates_page_lists_seeded_default_template():
+    with _client() as client:
+        r = client.get("/dashboard/resume-templates")
+        assert r.status_code == 200
+        assert "默认模板" in r.text
+
+
+def test_resume_template_create_update_set_default_delete_round_trip():
+    with _client() as client:
+        client.get("/dashboard/resume-templates")  # 确保种子默认模板存在，这样后面删掉新模板不会撞到"最后一个不能删"
+        create = client.post(
+            "/dashboard/resume-templates",
+            data={"name": "我的模板", "content": "# {{ basic.full_name }}"},
+            follow_redirects=True,
+        )
+        assert create.status_code == 200
+        assert "已新增模板" in create.text
+        assert "我的模板" in create.text
+
+        match = re.search(r"/dashboard/resume-templates/(\d+)/delete", create.text)
+        assert match, "没有在模板库页面找到新模板的删除链接"
+        # 页面上可能同时有默认模板和新模板的删除链接，取最后一个（新建的那个
+        # 通常渲染在后面，因为默认模板置顶展开）——用 name 附近的上下文更稳妥。
+        template_ids = [int(m) for m in re.findall(r"/dashboard/resume-templates/(\d+)/delete", create.text)]
+        new_template_id = template_ids[-1]
+
+        update = client.post(
+            f"/dashboard/resume-templates/{new_template_id}/update",
+            data={"name": "改名后的模板", "content": "## {{ basic.full_name }}"},
+            follow_redirects=True,
+        )
+        assert update.status_code == 200
+        assert "模板已更新" in update.text
+        assert "改名后的模板" in update.text
+
+        set_default = client.post(f"/dashboard/resume-templates/{new_template_id}/set-default", follow_redirects=True)
+        assert set_default.status_code == 200
+        assert "已设为默认模板" in set_default.text
+
+        delete = client.post(f"/dashboard/resume-templates/{new_template_id}/delete", follow_redirects=True)
+        assert delete.status_code == 200
+        assert "已删除模板" in delete.text
+        assert "改名后的模板" not in delete.text
+
+
+def test_resume_template_create_rejects_broken_jinja_syntax():
+    with _client() as client:
+        r = client.post(
+            "/dashboard/resume-templates",
+            data={"name": "坏模板", "content": "{% for x in %}"},
+            follow_redirects=True,
+        )
+        assert r.status_code == 200
+        assert 'class="flash error"' in r.text
+        # 校验失败不应该创建出一条能列出来的模板记录。
+        list_page = client.get("/dashboard/resume-templates")
+        assert "坏模板" not in list_page.text
+
+
+def test_resume_template_delete_last_one_shows_friendly_error():
+    with _client() as client:
+        page = client.get("/dashboard/resume-templates")
+        match = re.search(r"/dashboard/resume-templates/(\d+)/delete", page.text)
+        assert match, "至少应该有一个种子默认模板"
+        template_id = int(match.group(1))
+        r = client.post(f"/dashboard/resume-templates/{template_id}/delete", follow_redirects=True)
+        assert r.status_code == 200
+        assert "至少要保留一个" in r.text
+
+
+def test_resume_template_update_missing_id_returns_404():
+    with _client() as client:
+        r = client.post("/dashboard/resume-templates/9999/update", data={"name": "x", "content": "y"})
+        assert r.status_code == 404
+
+
+def test_tailor_draft_page_lists_md_templates_in_optgroup():
+    with _client() as client:
+        client.get("/dashboard/resume-templates")  # 确保种子默认模板存在
+        _seed_position_via_upload(client)
+        create = client.post(
+            "/dashboard/jobs",
+            data={
+                "company": "Beta Inc",
+                "title": "Big Data Engineer",
+                "description_raw": "We need Hadoop experience for our data platform.",
+            },
+            follow_redirects=False,
+        )
+        jd_url = create.headers["location"].split("?")[0]
+
+        # 跟 test_tailor_draft_page_includes_style_selector 一样：k=0 只需要
+        # 一次 JD 解析调用，直接给 /tailor 这次请求配好两个槽位的 Fake 即可，
+        # 不需要先跑一遍 /analyze。
+        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
+        app.dependency_overrides[get_light_client] = lambda: jd_parse_fake
+        app.dependency_overrides[get_heavy_client] = lambda: jd_parse_fake
+        try:
+            r = client.get(f"{jd_url}/tailor", params={"k": 0})
+        finally:
+            app.dependency_overrides.pop(get_light_client, None)
+            app.dependency_overrides.pop(get_heavy_client, None)
+
+        assert r.status_code == 200
+        assert "MD 模板" in r.text
+        assert "默认模板" in r.text
+
+
+def test_tailor_confirm_with_md_template_renders_via_template_path():
+    with _client() as client:
+        _seed_position_via_upload(client)
+
+        create_template = client.post(
+            "/dashboard/resume-templates",
+            data={"name": "我的自定义模板", "content": "# {{ basic.full_name }}\n\n自定义内容标记"},
+            follow_redirects=True,
+        )
+        template_ids = [int(m) for m in re.findall(r"/dashboard/resume-templates/(\d+)/delete", create_template.text)]
+        template_id = template_ids[-1]
+
+        jd_url = _seed_jd_with_score(client)
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={
+                "k_value": "0",
+                "hit_items_json": "[]",
+                "suggestion_count": "0",
+                "render_choice": f"template:{template_id}",
+            },
+            follow_redirects=True,
+        )
+        assert confirm.status_code == 200
+        assert "简历已生成" in confirm.text
+        assert "自定义内容标记" in confirm.text
+
+
+def test_tailor_confirm_with_unknown_template_id_shows_friendly_flash_error():
+    with _client() as client:
+        _seed_position_via_upload(client)
+        jd_url = _seed_jd_with_score(client)
+        confirm = client.post(
+            f"{jd_url}/tailor/confirm",
+            data={
+                "k_value": "0",
+                "hit_items_json": "[]",
+                "suggestion_count": "0",
+                "render_choice": "template:9999",
+            },
+            follow_redirects=True,
+        )
+        assert confirm.status_code == 200
+        assert "不存在了" in confirm.text

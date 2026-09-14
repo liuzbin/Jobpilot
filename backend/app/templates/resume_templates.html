@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}MD 简历模板库 - JobPilot{% endblock %}
+{% block content %}
+<h1>MD 简历模板库</h1>
+<p class="muted">
+  简历这里只有两个格式：一段 Markdown，和这段 Markdown 导出的同样式 PDF——风格靠你自己写的 Markdown 排版来控制，不需要另外维护一套 CSS。
+  这里的每个模板都是一段带占位符的 Markdown（<code>{{ '{{ basic.full_name }}' }}</code> 这种写法），生成简历时会用你的真实数据把占位符填上，
+  同一份内容再转成 PDF 只是"展示形式"之一。默认模板是按你上传的第一份简历反推出来的，可以直接编辑，也可以完全无视它、自己新增一份。
+</p>
+
+<div class="card">
+  <h2>已有模板（{{ resume_templates|length }} 个）</h2>
+  {% for tpl in resume_templates %}
+    <details class="template-block" {% if tpl.is_default %}open{% endif %} style="margin-bottom:12px; border:1px solid #e5e7eb; border-radius:6px; padding:8px 12px;">
+      <summary style="cursor:pointer;">
+        <strong>{{ tpl.name }}</strong>
+        {% if tpl.is_default %}<span class="muted">（默认）</span>{% endif %}
+      </summary>
+      <form method="post" action="/dashboard/resume-templates/{{ tpl.id }}/update" style="margin-top:10px;">
+        <label>模板名称</label>
+        <input type="text" name="name" value="{{ tpl.name }}">
+        <label>模板内容（Markdown + 占位符）</label>
+        <textarea name="content" rows="18" style="font-family:monospace; font-size:13px; width:100%;">{{ tpl.content }}</textarea>
+        <div style="margin-top:8px; display:flex; gap:8px;">
+          <button type="submit">保存修改</button>
+          {% if not tpl.is_default %}
+          <button type="submit" formaction="/dashboard/resume-templates/{{ tpl.id }}/set-default" class="secondary">设为默认</button>
+          {% endif %}
+          <button type="submit" formaction="/dashboard/resume-templates/{{ tpl.id }}/delete" class="secondary"
+                  onclick="return confirm('确定删除这个模板？已经用它生成过的简历不受影响。');">删除</button>
+        </div>
+      </form>
+    </details>
+  {% else %}
+    <p class="muted">还没有模板。</p>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>新增模板</h2>
+  <p class="muted">
+    可用占位符（渲染时缺失的字段留空，不会报错）：<code>basic.full_name / target_title / email / phone / current_location / github_url / linkedin_url</code>，
+    <code>{{ '{% for line in summary %}' }}</code> / <code>{{ '{% for line in skills %}' }}</code>，
+    <code>{{ '{% for exp in experience %}' }}</code>（<code>exp.company_name / position_title / project_name / date_range</code>，
+    以及 <code>{{ '{% for item in exp.bullet_items %}' }}</code> 取 <code>item.action_summary / result_summary</code>），
+    <code>{{ '{% for proj in projects %}' }}</code>（<code>proj.project_name / date_range / bullets</code>），
+    <code>{{ '{% for edu in education %}' }}</code>（<code>edu.school / degree / location / date_range</code>）。
+  </p>
+  <form method="post" action="/dashboard/resume-templates">
+    <label>模板名称</label>
+    <input type="text" name="name" placeholder="例如：英文单栏" required>
+    <label>模板内容</label>
+    <textarea name="content" rows="18" style="font-family:monospace; font-size:13px; width:100%;" placeholder="粘贴或编写你的 Markdown 模板…" required></textarea>
+    <label><input type="checkbox" name="set_default" value="1"> 设为默认模板</label>
+    <div style="margin-top:8px;"><button type="submit">新增模板</button></div>
+  </form>
+</div>
+{% endblock %}

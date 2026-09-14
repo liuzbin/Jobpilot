@@ -68,6 +68,14 @@ class ProfileBasic(Base):
     current_location: Mapped[str | None] = mapped_column(String(200))
     target_location: Mapped[str | None] = mapped_column(String(200))
     work_authorization: Mapped[str | None] = mapped_column(String(200))
+    # 打磨阶段后新增：MD 简历模板需要的"个人总结"/"技能"两块背景信息——
+    # 这两块不参与 JD 关键词匹配/K 值裁剪逻辑（不是某段具体经历的贡献句，
+    # 没有"命中/未命中"这个概念），每次生成简历都原样带上。存储成多行
+    # 纯文本，一行一条，对应 Dashboard 上的一个 textarea：这样写和读都不需要
+    # 额外的结构化解析，用户自己想怎么分段都行，简历模板渲染时按行拆成列表
+    # 逐行输出（见 resume_tailor.build_static_resume_context）。
+    resume_summary: Mapped[str | None] = mapped_column(Text)
+    skills_text: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
@@ -153,6 +161,102 @@ class ExperienceBullet(Base):
     position: Mapped[ExperienceEntry] = relationship(back_populates="bullets")
 
 
+class EducationEntry(Base):
+    """教育经历（打磨阶段后新增）：MD 简历模板里的 EDUCATION 一节需要能列出
+    多条学历（比如硕士+本科），`profile_basic.education/school` 这两个单值
+    字段不够用，这里单独开一张表。和公司经历不同，教育经历基本不会有措辞
+    分歧需要冲突确认，合并逻辑上按"学校+学位标准化后完全一致"做精确去重
+    就够用（见 profile_service.merge_parsed_experience），不做模糊匹配。"""
+
+    __tablename__ = "education_entry"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    school: Mapped[str | None] = mapped_column(String(300))
+    degree: Mapped[str | None] = mapped_column(String(300))
+    location: Mapped[str | None] = mapped_column(String(300))
+    start_date: Mapped[str | None] = mapped_column(String(20))
+    end_date: Mapped[str | None] = mapped_column(String(20))
+    is_current: Mapped[bool] = mapped_column(default=False)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PersonalProject(Base):
+    """独立项目（打磨阶段后新增）：不挂靠任何公司的个人/课外项目，对应 MD
+    简历模板里独立于工作经历之外的 PROJECT EXPERIENCE 一节。结构上刻意做成
+    和 experience_entry 的 B 层（position）平行但不复用同一张表——这类项目
+    没有"公司"这个上一级，也不需要 A/B/C 三层里 A 层那套精确匹配逻辑,复用
+    反而会让 experience_entry 的 level 语义变得混乱。
+
+    这一版明确不参与 JD 打分（scoring.build_profile_context）和简历重制的
+    关键词命中/延伸建议逻辑（resume_tailor.find_hit_bullets）——和
+    profile_basic.resume_summary/skills_text 一样，当成"静态背景信息",每次
+    生成简历都原样带上，不做 K 值裁剪。这是这一版刻意收窄的范围（见
+    docs/DEVELOPMENT_LOG.md 对应章节),不是遗漏。"""
+
+    __tablename__ = "personal_project"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    start_date: Mapped[str | None] = mapped_column(String(20))
+    end_date: Mapped[str | None] = mapped_column(String(20))
+    is_current: Mapped[bool] = mapped_column(default=False)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+    bullets: Mapped[list["PersonalProjectBullet"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class PersonalProjectBullet(Base):
+    """独立项目下的贡献句，结构上比 experience_bullet 简单——独立项目不参与
+    关键词匹配/延伸建议,所以不需要 tags/keywords/action_summary/result_summary
+    这些衍生字段,content 就是最终展示的完整文本。"""
+
+    __tablename__ = "personal_project_bullet"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("personal_project.id", ondelete="CASCADE"), nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    project: Mapped[PersonalProject] = relationship(back_populates="bullets")
+
+
+class ResumeTemplate(Base):
+    """MD 简历模板库（打磨阶段后新增，见实施方案对应章节）：`content` 是一段
+    带 Jinja2 占位符的 Markdown 源文本，渲染时喂给
+    `resume_template_service.render_template_markdown`，上下文结构见该模块
+    文档字符串。允许多个模板共存,`is_default` 恒有且只有一条为 True——
+    这条不变量由 resume_template_service 的写入逻辑维护，不是数据库约束
+    （sqlite 的部分唯一索引写法比较别扭，用代码保证更直接，也方便测试锁定）。
+
+    "内置样式"（default/compact，见 resume_pdf.AVAILABLE_RESUME_STYLES）
+    完全独立于这张表，两套机制并存、互不影响——这是打磨阶段用户反馈明确
+    要求"两套都留着，用户可选"的结果。"""
+
+    __tablename__ = "resume_template"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    is_default: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
 class JDRecord(Base):
     """JD 记录表：用户手动粘贴的岗位信息 + 解析后的结构化字段 + 投递状态机。"""
 
@@ -222,12 +326,23 @@ class ResumeVersion(Base):
     )
     k_value: Mapped[int] = mapped_column(Integer, nullable=False)  # 0-10
     style_id: Mapped[str] = mapped_column(String(100), default="default")
+    # 打磨阶段后新增：非空时代表这个版本用的是 MD 模板库里的某个模板渲染的，
+    # 此时 style_id 恒存一个固定哨兵值（resume_pdf.MD_TEMPLATE_STYLE_SENTINEL），
+    # 渲染走 resume_template_service 那条路径；为 None 时完全是旧行为，走
+    # style_id 对应的内置 CSS 模板（resume_pdf.AVAILABLE_RESUME_STYLES）。
+    # 模板被删除不应该让历史简历版本报错，所以用 SET NULL 而不是 CASCADE——
+    # 只是没法再用"换个 MD 模板重新渲染"这个操作了，已经生成好的 PDF/
+    # markdown_text 不受影响。
+    resume_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_template.id", ondelete="SET NULL")
+    )
     resume_json: Mapped[dict | None] = mapped_column(JSON)
     markdown_text: Mapped[str | None] = mapped_column(Text)
     pdf_path: Mapped[str | None] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     jd: Mapped[JDRecord] = relationship(back_populates="resume_versions")
+    resume_template: Mapped["ResumeTemplate | None"] = relationship()
 
 
 class QABankEntry(Base):

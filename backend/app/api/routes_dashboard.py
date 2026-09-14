@@ -45,16 +45,26 @@ from app.services.profile_deepening import (
 from app.services.profile_service import (
     add_bullet,
     add_company,
+    add_education_entry,
+    add_personal_project,
+    add_personal_project_bullet,
     add_position,
     delete_bullet,
     delete_company,
+    delete_education_entry,
+    delete_personal_project,
+    delete_personal_project_bullet,
     delete_position,
+    get_education_entries,
     get_experience_tree,
     get_or_create_profile_basic,
+    get_personal_projects,
     merge_parsed_experience,
     resolve_bullet_conflict,
     resolve_position_field,
     update_bullet_content,
+    update_education_entry,
+    update_personal_project,
     update_position_fields,
     update_profile_basic,
 )
@@ -64,14 +74,25 @@ from app.services.qa_bank_service import (
     list_qa_entries,
     save_qa_answers,
 )
-from app.services.resume_ingest import extract_text, structure_resume_text
-from app.services.resume_pdf import AVAILABLE_RESUME_STYLES, UnknownResumeStyleError
+from app.services.resume_ingest import extract_and_structure, extract_text
+from app.services.resume_md_parser import parse_resume_markdown
+from app.services.resume_pdf import AVAILABLE_RESUME_STYLES, MD_TEMPLATE_STYLE_SENTINEL, UnknownResumeStyleError
 from app.services.resume_tailor import (
     JDNotFoundError as TailorJDNotFoundError,
     ResumeVersionNotFoundError,
     build_resume_draft,
     confirm_and_finalize,
     regenerate_resume_pdf,
+)
+from app.services.resume_template_service import (
+    ResumeTemplateNotFoundError,
+    ResumeTemplateRenderError,
+    create_template as create_resume_template,
+    delete_template as delete_resume_template,
+    get_or_create_default_template,
+    list_templates as list_resume_templates,
+    set_default_template,
+    update_template_content,
 )
 
 router = APIRouter(prefix="/dashboard")
@@ -123,6 +144,8 @@ def profile_page(request: Request, db: Session = Depends(get_db)) -> HTMLRespons
             "active": "profile",
             "profile": profile,
             "experience": experience,
+            "education_entries": get_education_entries(db),
+            "personal_projects": get_personal_projects(db),
             **_flash_params(request),
         },
     )
@@ -144,6 +167,8 @@ def profile_update(
     current_location: str = Form(""),
     target_location: str = Form(""),
     work_authorization: str = Form(""),
+    resume_summary: str = Form(""),
+    skills_text: str = Form(""),
 ) -> RedirectResponse:
     fields = {
         "full_name": full_name or None,
@@ -158,6 +183,8 @@ def profile_update(
         "current_location": current_location or None,
         "target_location": target_location or None,
         "work_authorization": work_authorization or None,
+        "resume_summary": resume_summary or None,
+        "skills_text": skills_text or None,
     }
     update_profile_basic(db, fields)
     return _redirect_with_flash("/dashboard/profile", "基本信息已保存")
@@ -172,10 +199,6 @@ def profile_upload_resume(
 ):
     if resume_file is None or not resume_file.filename:
         return _redirect_with_flash("/dashboard/profile", "没有选择文件", error=True)
-    if light_client is None:
-        return _redirect_with_flash(
-            "/dashboard/profile", "轻量模型还没配置，请先到模型配置页面填写", error=True
-        )
 
     suffix = Path(resume_file.filename).suffix.lower()
     tmp_path: Path | None = None
@@ -184,26 +207,53 @@ def profile_upload_resume(
             tmp_path = Path(tmp.name)
             tmp.write(resume_file.file.read())
         raw_text = extract_text(tmp_path)
-        parsed = structure_resume_text(raw_text, light_client)
+        # .md 简历如果符合 JobPilot 模板约定，规则解析完全不需要 LLM；只有
+        # 解析不出来（非 md，或者不认识的自由格式 md）才会真的用到
+        # light_client，所以"轻量模型还没配置"这个检查放在这里、而不是
+        # 一进来就无条件拦截——不能让"还没配模型"挡住本来完全不需要模型
+        # 的规则解析路径。
+        rule_parsed = parse_resume_markdown(raw_text) if suffix == ".md" else None
+        if rule_parsed is not None:
+            parsed = rule_parsed
+        else:
+            if light_client is None:
+                return _redirect_with_flash(
+                    "/dashboard/profile", "轻量模型还没配置，请先到模型配置页面填写", error=True
+                )
+            parsed = extract_and_structure(tmp_path, raw_text, light_client)
         result = merge_parsed_experience(db, parsed)
         # 新增/更新的 bullet 顺带做一次关键词/行为/结果三元组抽取，供后面
         # 简历重制阶段做关键词匹配用。抽取失败不应该让整个上传流程失败——
         # 三元组只是衍生索引，没有它简历重制仍然能跑，只是匹配会更粗。
+        # light_client 为 None（规则解析成功、用户还没配模型）时直接跳过，
+        # 不强行报错——三元组抽取本来就是可选的衍生步骤。
         triads_backfilled = 0
-        try:
-            triads_backfilled = backfill_bullet_triads(db, light_client)
-        except Exception:  # noqa: BLE001
-            pass
+        if light_client is not None:
+            try:
+                triads_backfilled = backfill_bullet_triads(db, light_client)
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as exc:  # noqa: BLE001 - 面向用户的友好提示，细节已经包含在异常信息里
         return _redirect_with_flash("/dashboard/profile", f"简历解析失败: {exc}", error=True)
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
 
+    extra_bits = []
+    if "resume_summary" in result.basic_fields_filled:
+        extra_bits.append("个人总结")
+    if "skills_text" in result.basic_fields_filled:
+        extra_bits.append("技能")
+    if result.education_added:
+        extra_bits.append(f"{result.education_added} 条教育经历")
+    if result.projects_added or result.project_bullets_added:
+        extra_bits.append(f"{result.projects_added} 个独立项目（{result.project_bullets_added} 条贡献句）")
+    extra_msg = f"，另外补充了{'、'.join(extra_bits)}" if extra_bits else ""
+
     msg = (
         f"解析完成：新增 {result.companies_added} 家公司、{result.positions_added} 段经历、"
         f"{result.bullets_added} 条贡献句（跳过 {result.bullets_skipped_duplicate} 条重复），"
-        f"已为其中 {triads_backfilled} 条贡献句提炼关键词"
+        f"已为其中 {triads_backfilled} 条贡献句提炼关键词{extra_msg}"
     )
 
     if result.bullet_conflicts or result.position_field_conflicts:
@@ -351,6 +401,181 @@ def profile_update_bullet(
 def profile_delete_bullet(bullet_id: int, position_id: int = Form(...), db: Session = Depends(get_db)) -> RedirectResponse:
     delete_bullet(db, bullet_id)
     return _redirect_with_flash(f"/dashboard/profile/positions/{position_id}", "已删除贡献句")
+
+
+# ---------- 教育经历 / 独立项目（打磨阶段后新增，见 profile.html 的对应板块） ----------
+
+
+@router.post("/profile/education", dependencies=[Depends(require_local_browser)])
+def profile_add_education(
+    db: Session = Depends(get_db),
+    school: str = Form(...),
+    degree: str = Form(""),
+    location: str = Form(""),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+    is_current: str = Form(""),
+) -> RedirectResponse:
+    try:
+        add_education_entry(
+            db, school, degree=degree, location=location, start_date=start_date, end_date=end_date, is_current=bool(is_current)
+        )
+    except ValueError as exc:
+        return _redirect_with_flash("/dashboard/profile", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/profile", "已新增教育经历")
+
+
+@router.post("/profile/education/{entry_id}/update", dependencies=[Depends(require_local_browser)])
+def profile_update_education(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    school: str = Form(""),
+    degree: str = Form(""),
+    location: str = Form(""),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+    is_current: str = Form(""),
+) -> RedirectResponse:
+    try:
+        update_education_entry(
+            db,
+            entry_id,
+            {
+                "school": school,
+                "degree": degree,
+                "location": location,
+                "start_date": start_date,
+                "end_date": end_date,
+                "is_current": bool(is_current),
+            },
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="education entry not found")
+    return _redirect_with_flash("/dashboard/profile", "已更新教育经历")
+
+
+@router.post("/profile/education/{entry_id}/delete", dependencies=[Depends(require_local_browser)])
+def profile_delete_education(entry_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    delete_education_entry(db, entry_id)
+    return _redirect_with_flash("/dashboard/profile", "已删除教育经历")
+
+
+@router.post("/profile/projects", dependencies=[Depends(require_local_browser)])
+def profile_add_project(
+    db: Session = Depends(get_db),
+    project_name: str = Form(...),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+    is_current: str = Form(""),
+) -> RedirectResponse:
+    try:
+        add_personal_project(db, project_name, start_date=start_date, end_date=end_date, is_current=bool(is_current))
+    except ValueError as exc:
+        return _redirect_with_flash("/dashboard/profile", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/profile", "已新增独立项目")
+
+
+@router.post("/profile/projects/{project_id}/update", dependencies=[Depends(require_local_browser)])
+def profile_update_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    project_name: str = Form(""),
+    start_date: str = Form(""),
+    end_date: str = Form(""),
+    is_current: str = Form(""),
+) -> RedirectResponse:
+    try:
+        update_personal_project(
+            db, project_id, {"project_name": project_name, "start_date": start_date, "end_date": end_date, "is_current": bool(is_current)}
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="project not found")
+    return _redirect_with_flash("/dashboard/profile", "已更新独立项目")
+
+
+@router.post("/profile/projects/{project_id}/delete", dependencies=[Depends(require_local_browser)])
+def profile_delete_project(project_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    delete_personal_project(db, project_id)
+    return _redirect_with_flash("/dashboard/profile", "已删除独立项目")
+
+
+@router.post("/profile/projects/{project_id}/bullets", dependencies=[Depends(require_local_browser)])
+def profile_add_project_bullet(project_id: int, db: Session = Depends(get_db), content: str = Form(...)) -> RedirectResponse:
+    try:
+        add_personal_project_bullet(db, project_id, content)
+    except ValueError as exc:
+        return _redirect_with_flash("/dashboard/profile", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/profile", "已新增项目贡献句")
+
+
+@router.post("/profile/project-bullets/{bullet_id}/delete", dependencies=[Depends(require_local_browser)])
+def profile_delete_project_bullet(bullet_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    delete_personal_project_bullet(db, bullet_id)
+    return _redirect_with_flash("/dashboard/profile", "已删除项目贡献句")
+
+
+# ---------- MD 简历模板库（打磨阶段后新增） ----------
+
+
+@router.get("/resume-templates", response_class=HTMLResponse)
+def resume_templates_page(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
+    get_or_create_default_template(db)  # 确保空库场景下也有至少一个能选的模板
+    return templates.TemplateResponse(
+        "resume_templates.html",
+        {
+            "request": request,
+            "active": "resume_templates",
+            "resume_templates": list_resume_templates(db),
+            **_flash_params(request),
+        },
+    )
+
+
+@router.post("/resume-templates", dependencies=[Depends(require_local_browser)])
+def resume_template_create(
+    db: Session = Depends(get_db),
+    name: str = Form(...),
+    content: str = Form(...),
+    set_default: str = Form(""),
+) -> RedirectResponse:
+    try:
+        create_resume_template(db, name, content, set_default=bool(set_default))
+    except (ValueError, ResumeTemplateRenderError) as exc:
+        return _redirect_with_flash("/dashboard/resume-templates", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/resume-templates", "已新增模板")
+
+
+@router.post("/resume-templates/{template_id}/update", dependencies=[Depends(require_local_browser)])
+def resume_template_update(
+    template_id: int, db: Session = Depends(get_db), name: str = Form(""), content: str = Form("")
+) -> RedirectResponse:
+    try:
+        update_template_content(db, template_id, name=name or None, content=content or None)
+    except ResumeTemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except (ValueError, ResumeTemplateRenderError) as exc:
+        return _redirect_with_flash("/dashboard/resume-templates", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/resume-templates", "模板已更新")
+
+
+@router.post("/resume-templates/{template_id}/set-default", dependencies=[Depends(require_local_browser)])
+def resume_template_set_default(template_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    try:
+        set_default_template(db, template_id)
+    except ResumeTemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    return _redirect_with_flash("/dashboard/resume-templates", "已设为默认模板")
+
+
+@router.post("/resume-templates/{template_id}/delete", dependencies=[Depends(require_local_browser)])
+def resume_template_delete(template_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    try:
+        delete_resume_template(db, template_id)
+    except ResumeTemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as exc:
+        return _redirect_with_flash("/dashboard/resume-templates", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/resume-templates", "已删除模板")
 
 
 # ---------- JD 列表 / 详情 ----------
@@ -638,6 +863,29 @@ async def position_interview_submit(
 # ---------- 简历重制（Phase 2：K 值驱动 + 技能延伸建议确认） ----------
 
 
+def _parse_render_choice(raw: str | None) -> tuple[str, int | None]:
+    """生成/重新生成简历页面上的"风格"下拉框，内置风格和 MD 模板混在同一个
+    下拉框里选，选项 value 用一个前缀区分（"style:default" / "template:3"），
+    这里统一解析成 (style_id, resume_template_id) 二元组——两个下游函数
+    （confirm_and_finalize/regenerate_resume_pdf）都是这个约定，resume_template_id
+    非 None 时 style_id 会被忽略。
+
+    这里只负责拆前缀，不校验 style_id 是不是一个真实存在的内置风格——
+    "生成"和"重新生成"这两个调用方对"选了个不存在的风格"要不要报错的
+    容忍度不一样（前者悄悄回退成 default，后者要明确报错，见各自调用处
+    的注释），校验策略留给调用方决定，不要在这个共享的解析函数里就定死。
+    解析不出模板 id（表单被篡改）时兜底成内置默认风格。"""
+    raw = (raw or "").strip()
+    if raw.startswith("template:"):
+        try:
+            return "default", int(raw.split(":", 1)[1])
+        except ValueError:
+            return "default", None
+    if raw.startswith("style:"):
+        return raw.split(":", 1)[1] or "default", None
+    return "default", None
+
+
 @router.get("/jobs/{jd_id}/tailor", response_class=HTMLResponse)
 def job_tailor_draft(
     jd_id: int,
@@ -674,6 +922,7 @@ def job_tailor_draft(
             "suggestions": draft.suggestions,
             "hit_items_json": json.dumps(draft.hit_items, ensure_ascii=False),
             "available_styles": AVAILABLE_RESUME_STYLES,
+            "resume_templates": list_resume_templates(db),
             **_flash_params(request),
         },
     )
@@ -707,18 +956,21 @@ async def job_tailor_confirm(jd_id: int, request: Request, db: Session = Depends
             }
         )
 
-    # 表单上的风格下拉框选项就是 AVAILABLE_RESUME_STYLES 的 key，正常操作
-    # 不可能提交出一个不在里面的值；这里兜底回退到 "default" 而不是让一个
-    # 被篡改过的表单值直接把 UnknownResumeStyleError 捅到用户面前——挑错
-    # 风格不应该让整个"生成简历"操作失败,大不了渲染出来的是默认风格。
-    style_id = form.get("style_id") or "default"
-    if style_id not in AVAILABLE_RESUME_STYLES:
+    style_id, resume_template_id = _parse_render_choice(form.get("render_choice"))
+    # 挑错风格不应该让整个"生成简历"操作失败，大不了渲染出来的是默认风格
+    # （MD 模板路径不受影响——resume_template_id 非空时 style_id 本来就会
+    # 被 confirm_and_finalize 忽略）。
+    if resume_template_id is None and style_id not in AVAILABLE_RESUME_STYLES:
         style_id = "default"
 
     try:
-        resume_version = confirm_and_finalize(db, jd_id, k_value, hit_items, accepted_suggestions, style_id)
+        resume_version = confirm_and_finalize(
+            db, jd_id, k_value, hit_items, accepted_suggestions, style_id, resume_template_id
+        )
     except TailorJDNotFoundError:
         raise HTTPException(status_code=404, detail="JD not found")
+    except ResumeTemplateNotFoundError:
+        return _redirect_with_flash(detail_url, "选中的 MD 模板不存在了，请重新选择", error=True)
     except Exception as exc:  # noqa: BLE001
         return _redirect_with_flash(detail_url, f"生成简历失败: {exc}", error=True)
 
@@ -741,6 +993,8 @@ def resume_version_detail(
             "jd": jd,
             "resume_version": resume_version,
             "available_styles": AVAILABLE_RESUME_STYLES,
+            "resume_templates": list_resume_templates(db),
+            "md_template_style_sentinel": MD_TEMPLATE_STYLE_SENTINEL,
             **_flash_params(request),
         },
     )
@@ -748,21 +1002,23 @@ def resume_version_detail(
 
 @router.post("/jobs/{jd_id}/resumes/{resume_id}/regenerate-pdf", dependencies=[Depends(require_local_browser)])
 def resume_version_regenerate_pdf(
-    jd_id: int, resume_id: int, db: Session = Depends(get_db), style_id: str = Form("default")
+    jd_id: int, resume_id: int, db: Session = Depends(get_db), render_choice: str = Form("style:default")
 ) -> RedirectResponse:
     """Phase 5：简历风格自定义——不重新走 LLM 生成，只用已经存好的
-    `resume_json` 换一套风格重新渲染 PDF，方便用户在几套风格之间随便切换
-    对比效果。"""
+    `resume_json` 换一套风格/MD 模板重新渲染，方便用户随便切换对比效果。"""
     result_url = f"/dashboard/jobs/{jd_id}/resumes/{resume_id}"
+    style_id, resume_template_id = _parse_render_choice(render_choice)
     try:
-        regenerate_resume_pdf(db, resume_id, style_id)
+        regenerate_resume_pdf(db, resume_id, style_id, resume_template_id)
     except ResumeVersionNotFoundError:
         raise HTTPException(status_code=404, detail="resume version not found")
+    except ResumeTemplateNotFoundError:
+        return _redirect_with_flash(result_url, "选中的 MD 模板不存在了，请重新选择", error=True)
     except UnknownResumeStyleError as exc:
         return _redirect_with_flash(result_url, str(exc), error=True)
-    except Exception as exc:  # noqa: BLE001 - 例如 PdfRenderingUnavailableError
-        return _redirect_with_flash(result_url, f"重新生成 PDF 失败: {exc}", error=True)
-    return _redirect_with_flash(result_url, "已按新风格重新生成 PDF")
+    except Exception as exc:  # noqa: BLE001 - 例如 PdfRenderingUnavailableError / ResumeTemplateRenderError
+        return _redirect_with_flash(result_url, f"重新生成失败: {exc}", error=True)
+    return _redirect_with_flash(result_url, "已按新风格/模板重新生成")
 
 
 @router.get("/jobs/{jd_id}/resumes/{resume_id}/pdf")

@@ -46,7 +46,15 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
-from app.models.tables import ExperienceBullet, ExperienceEntry, ExperienceLevel, ProfileBasic
+from app.models.tables import (
+    EducationEntry,
+    ExperienceBullet,
+    ExperienceEntry,
+    ExperienceLevel,
+    PersonalProject,
+    PersonalProjectBullet,
+    ProfileBasic,
+)
 
 # 贡献句相似度阈值：高于这个值判定为"很可能是同一件事的不同措辞"，需要用户
 # 确认怎么处理；低于这个值就当成两条不相关的贡献句直接都保留。取 0.82 是
@@ -76,6 +84,11 @@ BASIC_FIELDS = [
     "current_location",
     "target_location",
     "work_authorization",
+    # 打磨阶段后新增，见 ExperienceEntry/ProfileBasic 表注释。这两个字段
+    # 存成多行纯文本（一条一行），和其它 BASIC_FIELDS 走一模一样的"表单
+    # 提交整体覆盖 / 简历解析只填空字段"逻辑,不需要单独的合并函数。
+    "resume_summary",
+    "skills_text",
 ]
 
 
@@ -164,6 +177,14 @@ class MergeResult:
     # hit_items_json 是同一个模式）。
     bullet_conflicts: list[dict] = field(default_factory=list)
     position_field_conflicts: list[dict] = field(default_factory=list)
+    # 打磨阶段后新增：教育经历/独立项目这两块"静态背景信息"的合并统计，
+    # 语义上不算"冲突"（不需要用户确认），所以没有对应的 conflicts 列表——
+    # 具体规则见 _merge_education_entries/_merge_personal_projects 的注释。
+    # 个人总结/技能这两个字段现在直接走 BASIC_FIELDS 那套"只填空"逻辑，
+    # 已经体现在 basic_fields_filled 里，不需要单独的统计字段。
+    education_added: int = 0
+    projects_added: int = 0
+    project_bullets_added: int = 0
 
 
 def _position_label(position: ExperienceEntry) -> str:
@@ -331,6 +352,35 @@ def _find_matching_position(
     return best_candidate
 
 
+_MONTH_DISPLAY_NAMES = [
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+
+def format_date_range(start_date: str | None, end_date: str | None, is_current: bool) -> str:
+    """把 "YYYY-MM"/"YYYY" 格式的起止时间拼成一段人可读的展示文本（比如
+    "Feb 2025 – 至今"），给 MD 简历模板用（见 resume_tailor.build_resume_json
+    里的 date_range 字段）——内置的 default/compact 两套 CSS 风格目前不需要
+    这个，日期解析失败就原样展示原始字符串，不强行报错。"""
+
+    def _display_one(value: str | None) -> str:
+        if not value:
+            return ""
+        match = _YEAR_MONTH_RE.match(str(value).strip())
+        if not match:
+            return str(value).strip()
+        year, month = match.group(1), match.group(2)
+        if month and 1 <= int(month) <= 12:
+            return f"{_MONTH_DISPLAY_NAMES[int(month)]} {year}"
+        return year
+
+    start_display = _display_one(start_date)
+    end_display = "至今" if is_current else _display_one(end_date)
+    if start_display and end_display:
+        return f"{start_display} – {end_display}"
+    return start_display or end_display
+
+
 def _find_similar_bullet(position: ExperienceEntry, bullet_text: str) -> tuple[ExperienceBullet | None, float]:
     """在 position 已有的贡献句里找和 bullet_text 最相似的一条，返回
     (最相似的 bullet 或 None, 相似度)。"""
@@ -345,6 +395,88 @@ def _find_similar_bullet(position: ExperienceEntry, bullet_text: str) -> tuple[E
     return best_bullet, best_ratio
 
 
+def _merge_education_entries(db: Session, entries_in: list[dict]) -> int:
+    """教育经历按"学校+学位标准化后完全一致"精确去重——教育经历条目数量
+    通常很少（1~3 条），不太会出现措辞上的微妙差异需要模糊匹配/冲突确认，
+    精确匹配已经够用，没必要复用职位合并那一整套模糊匹配机制。"""
+    existing = db.query(EducationEntry).all()
+    existing_keys = {(_norm(e.school), _norm(e.degree)) for e in existing}
+    max_order = max([e.order_index for e in existing], default=-1)
+
+    added = 0
+    for entry_in in entries_in:
+        school = (entry_in.get("school") or "").strip()
+        if not school:
+            continue
+        key = (_norm(school), _norm(entry_in.get("degree")))
+        if key in existing_keys:
+            continue
+        max_order += 1
+        db.add(
+            EducationEntry(
+                school=school,
+                degree=(entry_in.get("degree") or "").strip() or None,
+                location=(entry_in.get("location") or "").strip() or None,
+                start_date=entry_in.get("start_date"),
+                end_date=entry_in.get("end_date"),
+                is_current=bool(entry_in.get("is_current", False)),
+                order_index=max_order,
+            )
+        )
+        existing_keys.add(key)
+        added += 1
+    if added:
+        db.commit()
+    return added
+
+
+def _merge_personal_projects(db: Session, projects_in: list[dict]) -> tuple[int, int]:
+    """独立项目按项目名精确匹配（标准化后完全一致）合并——不像公司下的职位
+    那样做时间重叠+相似度的模糊匹配，是刻意收窄的范围：独立项目数量通常
+    很少，精确匹配已经能覆盖"重复上传同一份简历"这个最常见的场景，模糊
+    匹配那一套机制这里暂时不需要（见 docs/DEVELOPMENT_LOG.md 对应章节）。
+    贡献句按精确文本去重，逻辑和公司经历下的贡献句去重一致。"""
+    existing = db.query(PersonalProject).all()
+    existing_index = {_norm(p.project_name): p for p in existing}
+    max_order = max([p.order_index for p in existing], default=-1)
+
+    projects_added = 0
+    bullets_added = 0
+    for project_in in projects_in:
+        project_name = (project_in.get("project_name") or "").strip()
+        if not project_name:
+            continue
+        project = existing_index.get(_norm(project_name))
+        if project is None:
+            max_order += 1
+            project = PersonalProject(
+                project_name=project_name,
+                start_date=project_in.get("start_date"),
+                end_date=project_in.get("end_date"),
+                is_current=bool(project_in.get("is_current", False)),
+                order_index=max_order,
+            )
+            db.add(project)
+            db.flush()
+            existing_index[_norm(project_name)] = project
+            projects_added += 1
+
+        existing_bullet_texts = {_norm(b.content) for b in project.bullets}
+        max_bullet_order = max([b.order_index for b in project.bullets], default=-1)
+        for bullet_text in project_in.get("bullets", []):
+            bullet_text = (bullet_text or "").strip()
+            if not bullet_text or _norm(bullet_text) in existing_bullet_texts:
+                continue
+            max_bullet_order += 1
+            db.add(PersonalProjectBullet(project_id=project.id, content=bullet_text, order_index=max_bullet_order))
+            existing_bullet_texts.add(_norm(bullet_text))
+            bullets_added += 1
+
+    if projects_added or bullets_added:
+        db.commit()
+    return projects_added, bullets_added
+
+
 def merge_parsed_experience(db: Session, parsed: dict) -> MergeResult:
     """parsed 的结构见本文件顶部注释。做自动合并写入,返回统计结果，包括需要
     用户确认才会生效的冲突列表（result.bullet_conflicts / position_field_conflicts）。"""
@@ -352,6 +484,12 @@ def merge_parsed_experience(db: Session, parsed: dict) -> MergeResult:
 
     if parsed.get("basic"):
         result.basic_fields_filled = fill_blank_profile_basic_fields(db, parsed["basic"])
+
+    if parsed.get("education_entries"):
+        result.education_added = _merge_education_entries(db, parsed["education_entries"])
+
+    if parsed.get("projects"):
+        result.projects_added, result.project_bullets_added = _merge_personal_projects(db, parsed["projects"])
 
     existing_companies = (
         db.query(ExperienceEntry).filter(ExperienceEntry.level == ExperienceLevel.COMPANY).all()
@@ -632,6 +770,156 @@ def update_bullet_content(db: Session, bullet_id: int, content: str) -> Experien
 
 def delete_bullet(db: Session, bullet_id: int) -> bool:
     bullet = db.get(ExperienceBullet, bullet_id)
+    if bullet is None:
+        return False
+    db.delete(bullet)
+    db.commit()
+    return True
+
+
+# ---------- 教育经历 / 独立项目的手动增删改（打磨阶段后新增） ----------
+
+
+def get_education_entries(db: Session) -> list[EducationEntry]:
+    return db.query(EducationEntry).order_by(EducationEntry.order_index, EducationEntry.id).all()
+
+
+def add_education_entry(
+    db: Session,
+    school: str,
+    degree: str | None = None,
+    location: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    is_current: bool = False,
+) -> EducationEntry:
+    school = (school or "").strip()
+    if not school:
+        raise ValueError("学校名不能为空")
+    existing = db.query(EducationEntry).all()
+    max_order = max([e.order_index for e in existing], default=-1)
+    entry = EducationEntry(
+        school=school,
+        degree=(degree or "").strip() or None,
+        location=(location or "").strip() or None,
+        start_date=(start_date or "").strip() or None,
+        end_date=(end_date or "").strip() or None,
+        is_current=bool(is_current),
+        order_index=max_order + 1,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def update_education_entry(db: Session, entry_id: int, fields_in: dict) -> EducationEntry:
+    entry = db.get(EducationEntry, entry_id)
+    if entry is None:
+        raise ValueError(f"教育经历不存在：id={entry_id}")
+    for key in ("school", "degree", "location", "start_date", "end_date"):
+        if key in fields_in:
+            value = (fields_in[key] or "").strip() or None
+            setattr(entry, key, value)
+    if "is_current" in fields_in:
+        entry.is_current = bool(fields_in["is_current"])
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def delete_education_entry(db: Session, entry_id: int) -> bool:
+    entry = db.get(EducationEntry, entry_id)
+    if entry is None:
+        return False
+    db.delete(entry)
+    db.commit()
+    return True
+
+
+def get_personal_projects(db: Session) -> list[PersonalProject]:
+    return db.query(PersonalProject).order_by(PersonalProject.order_index, PersonalProject.id).all()
+
+
+def add_personal_project(
+    db: Session,
+    project_name: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    is_current: bool = False,
+) -> PersonalProject:
+    project_name = (project_name or "").strip()
+    if not project_name:
+        raise ValueError("项目名称不能为空")
+    existing = db.query(PersonalProject).all()
+    max_order = max([p.order_index for p in existing], default=-1)
+    project = PersonalProject(
+        project_name=project_name,
+        start_date=(start_date or "").strip() or None,
+        end_date=(end_date or "").strip() or None,
+        is_current=bool(is_current),
+        order_index=max_order + 1,
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def update_personal_project(db: Session, project_id: int, fields_in: dict) -> PersonalProject:
+    project = db.get(PersonalProject, project_id)
+    if project is None:
+        raise ValueError(f"独立项目不存在：id={project_id}")
+    for key in ("project_name", "start_date", "end_date"):
+        if key in fields_in:
+            value = (fields_in[key] or "").strip() or None
+            setattr(project, key, value)
+    if "is_current" in fields_in:
+        project.is_current = bool(fields_in["is_current"])
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def delete_personal_project(db: Session, project_id: int) -> bool:
+    project = db.get(PersonalProject, project_id)
+    if project is None:
+        return False
+    db.delete(project)
+    db.commit()
+    return True
+
+
+def add_personal_project_bullet(db: Session, project_id: int, content: str) -> PersonalProjectBullet:
+    project = db.get(PersonalProject, project_id)
+    if project is None:
+        raise ValueError(f"独立项目不存在：id={project_id}")
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("贡献句内容不能为空")
+    max_order = max([b.order_index for b in project.bullets], default=-1)
+    bullet = PersonalProjectBullet(project_id=project_id, content=content, order_index=max_order + 1)
+    db.add(bullet)
+    db.commit()
+    db.refresh(bullet)
+    return bullet
+
+
+def update_personal_project_bullet(db: Session, bullet_id: int, content: str) -> PersonalProjectBullet:
+    bullet = db.get(PersonalProjectBullet, bullet_id)
+    if bullet is None:
+        raise ValueError(f"贡献句不存在：id={bullet_id}")
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("贡献句内容不能为空")
+    bullet.content = content
+    db.commit()
+    db.refresh(bullet)
+    return bullet
+
+
+def delete_personal_project_bullet(db: Session, bullet_id: int) -> bool:
+    bullet = db.get(PersonalProjectBullet, bullet_id)
     if bullet is None:
         return False
     db.delete(bullet)

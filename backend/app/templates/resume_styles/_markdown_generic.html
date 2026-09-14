@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>简历</title>
+<style>
+  {# 打磨阶段用户反馈第 1 点："风格只需要控制 md 的格式，不需要 css 渲染"——
+     这份 CSS 刻意做到"只负责让任意 Markdown 都能正常读"，不针对任何一个
+     具体模板的排版做定制。所有 MD 模板（不管是内置默认模板还是用户自己
+     上传的）转成 PDF 时都共用这一份样式，模板之间的视觉差异完全来自
+     Markdown 内容本身的结构（标题层级、加粗、列表、内嵌的 <div align>），
+     不是来自换了一套 CSS。#}
+  @page {
+    size: A4;
+    margin: 18mm 16mm;
+  }
+  body {
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "SimSun", Arial, sans-serif;
+    font-size: 10.5pt;
+    color: #1a1a1a;
+    line-height: 1.5;
+    margin: 0;
+  }
+  h1 {
+    font-size: 18pt;
+    margin: 0 0 2mm 0;
+  }
+  h2 {
+    font-size: 12pt;
+    border-bottom: 1pt solid #ccc;
+    padding-bottom: 1mm;
+    margin: 6mm 0 3mm 0;
+  }
+  h3 {
+    font-size: 11pt;
+    margin: 4mm 0 2mm 0;
+  }
+  p {
+    margin: 0 0 2mm 0;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  ul, ol {
+    margin: 1mm 0 3mm 0;
+    padding-left: 5mm;
+  }
+  li {
+    margin-bottom: 1mm;
+  }
+  hr {
+    border: none;
+    border-top: 1pt solid #ccc;
+    margin: 4mm 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 2mm 0;
+  }
+  th, td {
+    border: 1pt solid #ccc;
+    padding: 1mm 2mm;
+    text-align: left;
+  }
+  blockquote {
+    color: #555;
+    border-left: 2pt solid #ccc;
+    margin: 2mm 0;
+    padding-left: 3mm;
+  }
+</style>
+</head>
+<body>
+{{ body_html | safe }}
+</body>
+</html>

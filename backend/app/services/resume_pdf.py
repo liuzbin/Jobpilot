@@ -43,6 +43,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import markdown as _markdown_lib
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 
 from app.core.config import get_settings
@@ -117,4 +118,56 @@ def save_resume_pdf(resume_version_id: int, resume_json: dict, style_id: str = "
     resumes_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = resumes_dir / f"resume_{resume_version_id}.pdf"
     pdf_path.write_bytes(render_resume_pdf_bytes(resume_json, style_id))
+    return pdf_path
+
+
+# ---------- 打磨阶段新增：MD 模板驱动的渲染（见 resume_template_service.py） ----------
+#
+# 这一路和上面 style_id 驱动的两套内置风格完全独立：不复用 AVAILABLE_RESUME_STYLES，
+# 也不新增进那个字典——MD 模板的"排版"是模板内容本身决定的，这里只负责
+# "把渲染好的 Markdown 转成 PDF"这一步通用逻辑，套的是固定的一份极简 CSS
+# （_markdown_generic.html），不针对任何一个具体模板定制样式。
+
+MD_TEMPLATE_STYLE_SENTINEL = "md_template"
+
+
+def render_markdown_to_html_body(markdown_text: str) -> str:
+    """Markdown 源文本转 HTML 片段。`extra`/`sane_lists` 这两个扩展是
+    python-markdown 官方内置的，分别补上表格/代码块等常见写法、以及更符合
+    直觉的列表解析规则；模板里直接内嵌的原始 HTML（比如 <div align="right">）
+    默认就会被原样保留穿透，不需要额外配置。"""
+    return _markdown_lib.markdown(markdown_text or "", extensions=["extra", "sane_lists"])
+
+
+def render_markdown_resume_html(markdown_text: str) -> str:
+    body_html = render_markdown_to_html_body(markdown_text)
+    template = _env.get_template("_markdown_generic.html")
+    return template.render(body_html=body_html)
+
+
+def render_markdown_resume_pdf_bytes(markdown_text: str) -> bytes:
+    if _WeasyPrintHTML is None:
+        raise PdfRenderingUnavailableError(
+            "PDF 渲染依赖未就绪：WeasyPrint 需要系统级的 Pango/GObject 库。"
+            "Windows 上本地 App 启动时会自动检测并尝试静默安装 GTK3 Runtime"
+            "（详见启动日志里"
+            "\"PDF 渲染依赖检查：...\"这一行）——如果日志说已经自动装好了，"
+            "重启一次本地 App 即可；如果日志说自动安装失败了，可以按日志里给的"
+            "链接手动安装。不影响简历的 Markdown/结构化数据内容。"
+            f" 原始错误：{_WEASYPRINT_IMPORT_ERROR}"
+        )
+    html_text = render_markdown_resume_html(markdown_text)
+    return _WeasyPrintHTML(string=html_text).write_pdf()
+
+
+def save_markdown_resume_pdf(resume_version_id: int, markdown_text: str) -> Path:
+    """和 save_resume_pdf 是同一个落盘约定（同一个目录、同一套文件名规则），
+    只是渲染路径换成了"MD 模板 -> HTML -> PDF"这一条，供
+    resume_tailor.confirm_and_finalize/regenerate_resume_pdf 在
+    resume_template_id 非空时调用。"""
+    settings = get_settings()
+    resumes_dir = settings.home / "resumes"
+    resumes_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = resumes_dir / f"resume_{resume_version_id}.pdf"
+    pdf_path.write_bytes(render_markdown_resume_pdf_bytes(markdown_text))
     return pdf_path
