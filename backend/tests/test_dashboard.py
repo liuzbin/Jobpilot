@@ -109,6 +109,78 @@ def test_profile_update_persists_fields():
         assert "Alice" in r.text
 
 
+# ---------- 备注信息 / Skills / 项目标签（LinkedIn 画像功能新增） ----------
+
+
+def test_profile_page_shows_new_linkedin_profile_sections():
+    with _client() as client:
+        r = client.get("/dashboard/profile")
+        assert r.status_code == 200
+        assert "备注信息" in r.text
+        assert "Skills" in r.text
+        assert "项目经历" in r.text
+        assert "从 LinkedIn 导入" in r.text
+
+
+def test_profile_update_notes_does_not_clobber_basic_info():
+    with _client() as client:
+        client.post("/dashboard/profile", data={"full_name": "Alice", "target_title": "Backend Engineer"})
+        r = client.post(
+            "/dashboard/profile/notes",
+            data={"additional_notes": "Prefers remote work; strong at 0-to-1 system design."},
+            follow_redirects=True,
+        )
+        assert r.status_code == 200
+        assert "备注信息已保存" in r.text
+        assert "Prefers remote work" in r.text
+        assert "Alice" in r.text
+        assert "Backend Engineer" in r.text
+
+
+def test_profile_add_and_delete_skill():
+    with _client() as client:
+        add = client.post("/dashboard/profile/skills", data={"skill_name": "Python"}, follow_redirects=True)
+        assert add.status_code == 200
+        assert "已新增技能" in add.text
+        assert "Python" in add.text
+
+        match = re.search(r"/dashboard/profile/skills/(\d+)/delete", add.text)
+        assert match, "没有在画像页面找到技能的删除链接"
+        skill_id = int(match.group(1))
+
+        delete = client.post(f"/dashboard/profile/skills/{skill_id}/delete", follow_redirects=True)
+        assert delete.status_code == 200
+        assert "已删除技能" in delete.text
+
+
+def test_profile_add_skill_rejects_empty_and_duplicate():
+    with _client() as client:
+        empty = client.post("/dashboard/profile/skills", data={"skill_name": "   "}, follow_redirects=True)
+        assert 'class="flash error"' in empty.text
+
+        client.post("/dashboard/profile/skills", data={"skill_name": "Python"})
+        dup = client.post("/dashboard/profile/skills", data={"skill_name": "python"}, follow_redirects=True)
+        assert 'class="flash error"' in dup.text
+
+
+def test_profile_update_project_tag_only_does_not_touch_project_name():
+    with _client() as client:
+        add = client.post(
+            "/dashboard/profile/projects", data={"project_name": "Side Bot", "start_date": "2023"}, follow_redirects=True
+        )
+        match = re.search(r"/dashboard/profile/projects/(\d+)/delete", add.text)
+        assert match
+        project_id = int(match.group(1))
+
+        r = client.post(
+            f"/dashboard/profile/projects/{project_id}/tag", data={"company_tag": "Acme Corp"}, follow_redirects=True
+        )
+        assert r.status_code == 200
+        assert "已更新关联标签" in r.text
+        assert "Side Bot" in r.text
+        assert "关联公司：Acme Corp" in r.text
+
+
 def test_job_create_then_detail_page_shows_it():
     with _client() as client:
         r = client.post(

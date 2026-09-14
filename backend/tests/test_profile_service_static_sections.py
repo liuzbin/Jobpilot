@@ -7,20 +7,25 @@ from __future__ import annotations
 
 import pytest
 
-from app.models.tables import EducationEntry, PersonalProject, PersonalProjectBullet
+from app.models.tables import EducationEntry, PersonalProject, PersonalProjectBullet, ProfileSkill
 from app.services.profile_service import (
     add_education_entry,
     add_personal_project,
     add_personal_project_bullet,
+    add_profile_skill,
     delete_education_entry,
     delete_personal_project,
     delete_personal_project_bullet,
+    delete_profile_skill,
     format_date_range,
     get_education_entries,
+    get_or_create_profile_basic,
     get_personal_projects,
+    get_profile_skills,
     merge_parsed_experience,
     update_education_entry,
     update_personal_project,
+    update_profile_basic,
 )
 
 
@@ -183,3 +188,96 @@ def test_add_personal_project_bullet_requires_content(db_session):
     project = add_personal_project(db_session, "My Project")
     with pytest.raises(ValueError):
         add_personal_project_bullet(db_session, project.id, "   ")
+
+
+# ---------- 独立项目关联公司标签（LinkedIn 画像功能新增） ----------
+
+
+def test_merge_personal_projects_sets_company_tag_on_create(db_session):
+    result = merge_parsed_experience(
+        db_session, _parsed_with(projects=[{"project_name": "Side Bot", "company_tag": "Acme Corp"}])
+    )
+    assert result.projects_added == 1
+    project = get_personal_projects(db_session)[0]
+    assert project.company_tag == "Acme Corp"
+
+
+def test_merge_personal_projects_fills_blank_tag_but_does_not_overwrite_existing(db_session):
+    project = add_personal_project(db_session, "Side Bot")
+    update_personal_project(db_session, project.id, {"company_tag": "Manually Set Co"})
+
+    merge_parsed_experience(
+        db_session, _parsed_with(projects=[{"project_name": "Side Bot", "company_tag": "From LinkedIn Co"}])
+    )
+    assert get_personal_projects(db_session)[0].company_tag == "Manually Set Co"
+
+    # 一个还没打过标签的项目，合并进来的标签应该能正常填上去。
+    other = add_personal_project(db_session, "Other Bot")
+    merge_parsed_experience(
+        db_session, _parsed_with(projects=[{"project_name": "Other Bot", "company_tag": "From LinkedIn Co"}])
+    )
+    db_session.refresh(other)
+    assert other.company_tag == "From LinkedIn Co"
+
+
+def test_update_personal_project_tag_only_does_not_touch_other_fields(db_session):
+    project = add_personal_project(db_session, "My Project", start_date="2022-01")
+    updated = update_personal_project(db_session, project.id, {"company_tag": "Acme Corp"})
+    assert updated.company_tag == "Acme Corp"
+    assert updated.project_name == "My Project"
+    assert updated.start_date == "2022-01"
+
+
+# ---------- 结构化技能标签合并 + 手动增删（LinkedIn 画像功能新增） ----------
+
+
+def test_merge_skills_adds_new_and_dedupes_case_insensitively(db_session):
+    result = merge_parsed_experience(db_session, _parsed_with(skills=["Python", "PostgreSQL", "python"]))
+    assert result.skills_added == 2
+    assert {s.skill_name for s in get_profile_skills(db_session)} == {"Python", "PostgreSQL"}
+
+    result2 = merge_parsed_experience(db_session, _parsed_with(skills=["POSTGRESQL", "Go"]))
+    assert result2.skills_added == 1
+    assert {s.skill_name for s in get_profile_skills(db_session)} == {"Python", "PostgreSQL", "Go"}
+
+
+def test_merge_skills_noop_for_resume_upload_parsed_dict_without_skills_key(db_session):
+    # 简历上传解析出的 parsed 字典不带 "skills" 这个 key（技能走的是
+    # skills_text 那套 BASIC_FIELDS 逻辑），确认这里不会因为 key 缺失报错，
+    # 也确实不会新增任何 profile_skill 记录。
+    result = merge_parsed_experience(db_session, _parsed_with())
+    assert result.skills_added == 0
+    assert get_profile_skills(db_session) == []
+
+
+def test_add_profile_skill_requires_name(db_session):
+    with pytest.raises(ValueError):
+        add_profile_skill(db_session, "  ")
+
+
+def test_add_profile_skill_rejects_duplicate(db_session):
+    add_profile_skill(db_session, "Python")
+    with pytest.raises(ValueError):
+        add_profile_skill(db_session, "python")
+
+
+def test_delete_profile_skill(db_session):
+    skill = add_profile_skill(db_session, "Python")
+    assert delete_profile_skill(db_session, skill.id) is True
+    assert get_profile_skills(db_session) == []
+
+
+def test_delete_profile_skill_missing_returns_false(db_session):
+    assert delete_profile_skill(db_session, 9999) is False
+
+
+# ---------- additional_notes（LinkedIn 画像功能新增） ----------
+
+
+def test_update_profile_basic_partial_dict_does_not_clobber_other_fields(db_session):
+    update_profile_basic(db_session, {"full_name": "Alice", "target_title": "Engineer"})
+    update_profile_basic(db_session, {"additional_notes": "Prefers remote work."})
+    profile = get_or_create_profile_basic(db_session)
+    assert profile.full_name == "Alice"
+    assert profile.target_title == "Engineer"
+    assert profile.additional_notes == "Prefers remote work."

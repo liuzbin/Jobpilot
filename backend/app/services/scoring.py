@@ -22,6 +22,13 @@ SCORING_SYSTEM_PROMPT = """\
 你的任务是严格按照给定的评分维度，评估候选人画像与目标JD的匹配度。你只负责给出
 语义判断和证据，不需要自己计算最终分数（后续有专门的程序按规则计算）。
 
+候选人画像里的 `basic.additional_notes` 字段（如果非空）是候选人自己填写的
+附加信息，比如自我评价的优势/劣势、求职偏好等，不是某段具体经历的事实描述。
+请把它当成候选人本人提供的补充背景来理解，在判断 skill_fit_score、
+matched_key_skills、strengths、weaknesses 时加以考虑——但不要凭空把候选人
+自己说的话直接当成"命中的关键技能"或者不加验证地照抄进 strengths，仍然要
+结合画像里的真实经历判断是否站得住脚。
+
 请基于候选人画像（JSON）和目标 JD 的结构化字段与原文，严格按下面的 JSON 格式输出：
 {
   "skill_fit_score": 0到100之间的整数，反映候选人的关键字和经验描述与JD核心职责的重合度,
@@ -70,6 +77,13 @@ def build_profile_context(profile: ProfileBasic, experience_entries: list[Experi
             "current_location": profile.current_location,
             "target_location": profile.target_location,
             "work_authorization": profile.work_authorization,
+            # 打磨阶段后新增：候选人自己填写的附加信息（自我评价的优势/
+            # 劣势、求职偏好等），见 ProfileBasic.additional_notes 的表
+            # 注释和上面 SCORING_SYSTEM_PROMPT 里对应的说明——这是唯一一
+            # 处会实际进入 LLM 语义判断的"静态背景信息"，compute_score
+            # 的确定性数值计算完全不读这个字段，只通过 llm_judgement 的
+            # strengths/weaknesses 间接体现。
+            "additional_notes": profile.additional_notes,
         },
         "experience": companies,
     }

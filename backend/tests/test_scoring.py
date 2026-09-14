@@ -14,8 +14,10 @@ from app.services.scoring import (
     HARD_REQUIREMENT_PENALTY,
     PLUS_SKILL_BONUS,
     PLUS_SKILL_BONUS_CAP,
+    SCORING_SYSTEM_PROMPT,
     YEARS_GAP_PENALTY_CAP,
     YEARS_GAP_PENALTY_PER_YEAR,
+    build_profile_context,
     compute_score,
 )
 
@@ -176,3 +178,26 @@ def test_total_score_clamped_to_0_even_with_heavy_penalties():
 
     result = compute_score(profile, jd_parsed, llm_judgement)
     assert result.total_score == 0
+
+
+# ---------- additional_notes：唯一一处会实际进 LLM 语义判断的"静态背景
+# 信息"（LinkedIn 画像功能新增，见 scoring.py 模块文档字符串对应说明） ----------
+
+
+def test_build_profile_context_includes_additional_notes():
+    profile = _profile()
+    profile.additional_notes = "Prefers remote work; strong at 0-to-1 system design."
+    context = build_profile_context(profile, [])
+    assert context["basic"]["additional_notes"] == "Prefers remote work; strong at 0-to-1 system design."
+
+
+def test_build_profile_context_additional_notes_defaults_to_none():
+    profile = _profile()
+    context = build_profile_context(profile, [])
+    assert context["basic"]["additional_notes"] is None
+
+
+def test_scoring_system_prompt_instructs_llm_to_consider_additional_notes():
+    # 弱断言：只确认提示词里确实提到了这个字段，具体措辞后续可以调整，
+    # 不在这里锁死——真正锁定行为的是上面 build_profile_context 那两条。
+    assert "additional_notes" in SCORING_SYSTEM_PROMPT

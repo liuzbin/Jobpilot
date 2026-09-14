@@ -35,6 +35,7 @@ from app.core.llm_client import LLMClient
 from app.models.tables import JDRecord, JDStatus, QASource, ResumeVersion
 from app.services.autofill import build_autofill_plan
 from app.services.jd_ingest import create_jd
+from app.services.profile_service import merge_parsed_experience
 from app.services.qa_bank_service import add_qa_entry
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_paired_request)])
@@ -74,6 +75,127 @@ def submit_job(payload: ExtensionJobSubmission, db: Session = Depends(get_db)) -
     )
     dashboard_url = f"http://{settings.host}:{settings.port}/dashboard/jobs/{jd.id}"
     return ExtensionJobCreatedResponse(jd_id=jd.id, dashboard_url=dashboard_url)
+
+
+# ---------- LinkedIn 画像导入（打磨阶段后新增） ----------
+#
+# 插件侧在侧边栏输入 LinkedIn 个人主页地址后，会把该 tab 导航过去，用内容
+# 脚本（content_scripts/linkedin_profile_parser.js，纯 DOM 抓取，不需要
+# LLM）解析出下面这套结构，再经由 background service worker 发到这个
+# 接口——和插件抓 JD 送 /api/jobs 是同一套"内容脚本只管抓取，真正的网络
+# 请求只在 background 里发生"的分工。
+#
+# 数据结构故意和 profile_service.merge_parsed_experience 已经在用的
+# `parsed` 字典完全同构（companies/positions/bullets、education_entries、
+# projects 的字段名和上传简历解析出来的结构一模一样）——这样可以直接复用
+# 同一套合并逻辑（公司/职位的精确+模糊匹配、贡献句去重、教育经历/独立
+# 项目精确去重），不需要为 LinkedIn 这个数据源单独再写一遍合并规则。
+# 唯一的新增字段是 `skills`（结构化技能标签列表,见 ProfileSkill 表注释）
+# 和 `projects[].company_tag`（独立项目关联公司的自由文本标签,见
+# PersonalProject 表注释）。
+
+
+class ExtensionLinkedInBasicInfo(BaseModel):
+    full_name: str | None = None
+    target_title: str | None = None
+    current_location: str | None = None
+    linkedin_url: str | None = None
+    resume_summary: str | None = None  # LinkedIn "About" 板块 -> 个人简介
+
+
+class ExtensionLinkedInEducationEntry(BaseModel):
+    school: str
+    degree: str | None = None
+    location: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    is_current: bool = False
+
+
+class ExtensionLinkedInProject(BaseModel):
+    project_name: str
+    start_date: str | None = None
+    end_date: str | None = None
+    is_current: bool = False
+    company_tag: str | None = None
+    bullets: list[str] = []
+
+
+class ExtensionLinkedInPosition(BaseModel):
+    position_title: str | None = None
+    project_name: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    is_current: bool = False
+    bullets: list[str] = []
+
+
+class ExtensionLinkedInCompany(BaseModel):
+    company_name: str
+    positions: list[ExtensionLinkedInPosition] = []
+
+
+class ExtensionLinkedInProfileSubmission(BaseModel):
+    basic: ExtensionLinkedInBasicInfo | None = None
+    skills: list[str] = []
+    education_entries: list[ExtensionLinkedInEducationEntry] = []
+    projects: list[ExtensionLinkedInProject] = []
+    companies: list[ExtensionLinkedInCompany] = []
+    source_url: str | None = None
+
+
+class ExtensionLinkedInProfileResponse(BaseModel):
+    dashboard_url: str
+    companies_added: int
+    positions_added: int
+    bullets_added: int
+    education_added: int
+    projects_added: int
+    project_bullets_added: int
+    skills_added: int
+    basic_fields_filled: list[str]
+    has_conflicts: bool
+
+
+@router.post("/linkedin-profile", response_model=ExtensionLinkedInProfileResponse)
+def submit_linkedin_profile(
+    payload: ExtensionLinkedInProfileSubmission, db: Session = Depends(get_db)
+) -> ExtensionLinkedInProfileResponse:
+    settings = get_settings()
+    has_any_content = bool(
+        (payload.basic and payload.basic.model_dump(exclude_none=True))
+        or payload.skills
+        or payload.education_entries
+        or payload.projects
+        or payload.companies
+    )
+    if not has_any_content:
+        # 和 submit_job 的空描述兜底是同一个道理：页面结构识别失败、什么都
+        # 没抓到时，不要往库里塞一次空的合并操作，让插件侧能明确提示用户
+        # "这个页面没抓到内容，确认一下是不是本人的 LinkedIn 主页"。
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="LinkedIn 主页解析结果为空，抓取失败")
+
+    parsed = {
+        "basic": payload.basic.model_dump(exclude_none=True) if payload.basic else {},
+        "skills": payload.skills,
+        "education_entries": [e.model_dump() for e in payload.education_entries],
+        "projects": [p.model_dump() for p in payload.projects],
+        "companies": [c.model_dump() for c in payload.companies],
+    }
+    result = merge_parsed_experience(db, parsed)
+    dashboard_url = f"http://{settings.host}:{settings.port}/dashboard/profile"
+    return ExtensionLinkedInProfileResponse(
+        dashboard_url=dashboard_url,
+        companies_added=result.companies_added,
+        positions_added=result.positions_added,
+        bullets_added=result.bullets_added,
+        education_added=result.education_added,
+        projects_added=result.projects_added,
+        project_bullets_added=result.project_bullets_added,
+        skills_added=result.skills_added,
+        basic_fields_filled=result.basic_fields_filled,
+        has_conflicts=bool(result.bullet_conflicts or result.position_field_conflicts),
+    )
 
 
 # ---------- Phase 4：自动化填表 ----------

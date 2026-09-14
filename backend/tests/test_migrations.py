@@ -23,6 +23,7 @@ EXPECTED_TABLES = {
     "personal_project",
     "personal_project_bullet",
     "resume_template",
+    "profile_skill",
 }
 
 

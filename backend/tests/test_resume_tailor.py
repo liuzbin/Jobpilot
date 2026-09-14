@@ -652,6 +652,44 @@ def test_confirm_and_finalize_includes_static_sections_in_resume_json(db_session
     assert "Side Bot" in resume_version.markdown_text
 
 
+def test_confirm_and_finalize_appends_profile_skills_not_already_in_skills_text(db_session):
+    """结构化技能标签（LinkedIn 画像功能新增，见 ProfileSkill 表注释）作为
+    补充追加在 skills_text 派生的行之后,已经在 skills_text 里出现过的标签
+    不应该重复出现。"""
+    from app.services.profile_service import add_profile_skill
+
+    position_id = _seed_experience(db_session)
+    update_profile_basic(db_session, {"skills_text": "Python, Go"})
+    add_profile_skill(db_session, "Python")  # 已经在 skills_text 里提到过，不应该重复列出
+    add_profile_skill(db_session, "Kubernetes")
+    add_profile_skill(db_session, "Terraform")
+
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Hadoop experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 0, hit_items, [])
+
+    skills_lines = resume_version.resume_json["skills"]
+    assert skills_lines[0] == "Python, Go"
+    assert len(skills_lines) == 2
+    assert "Kubernetes" in skills_lines[1]
+    assert "Terraform" in skills_lines[1]
+    assert "Python" not in skills_lines[1]
+
+
+def test_confirm_and_finalize_uses_profile_skills_when_skills_text_blank(db_session):
+    from app.services.profile_service import add_profile_skill
+
+    position_id = _seed_experience(db_session)
+    add_profile_skill(db_session, "Rust")
+    add_profile_skill(db_session, "Go")
+
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Hadoop experience.")
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 0, hit_items, [])
+
+    assert resume_version.resume_json["skills"] == ["Rust, Go"]
+
+
 def test_claimed_skill_does_not_affect_scoring(db_session):
     position_id = _seed_experience(db_session)
     update_profile_basic(db_session, {"years_experience": 3.0, "education": "Bachelor's degree"})

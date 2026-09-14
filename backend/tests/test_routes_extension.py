@@ -300,3 +300,148 @@ def test_mark_job_applied_404_when_jd_missing():
         headers = _auth_headers(client)
         r = client.post("/api/jobs/9999/mark-applied", headers=headers)
         assert r.status_code == 404
+
+
+# ---------- LinkedIn 画像导入（打磨阶段后新增） ----------
+
+
+def test_submit_linkedin_profile_rejects_missing_auth():
+    with TestClient(app) as client:
+        r = client.post("/api/linkedin-profile", json={"skills": ["Python"]})
+        assert r.status_code == 403
+
+
+def test_submit_linkedin_profile_rejects_empty_payload():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.post("/api/linkedin-profile", json={}, headers=headers)
+        assert r.status_code == 422
+
+
+def test_submit_linkedin_profile_merges_into_profile_and_returns_dashboard_url():
+    from app.core.db import get_sessionmaker
+    from app.models.tables import EducationEntry, ExperienceEntry, ExperienceLevel, PersonalProject, ProfileSkill
+
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        r = client.post(
+            "/api/linkedin-profile",
+            json={
+                "basic": {
+                    "full_name": "Alice Example",
+                    "target_title": "Senior Backend Engineer",
+                    "current_location": "Toronto, ON",
+                    "linkedin_url": "https://www.linkedin.com/in/alice-example",
+                    "resume_summary": "Backend engineer with 8 years of experience.",
+                },
+                "skills": ["Python", "PostgreSQL", "Python"],
+                "education_entries": [
+                    {"school": "University of Waterloo", "degree": "BASc Computer Engineering", "start_date": "2014", "end_date": "2018"}
+                ],
+                "projects": [
+                    {
+                        "project_name": "JobPilot",
+                        "start_date": "2025-01",
+                        "is_current": True,
+                        "company_tag": "Acme Corp",
+                        "bullets": ["Built an AI-assisted job application tool"],
+                    }
+                ],
+                "companies": [
+                    {
+                        "company_name": "Acme Corp",
+                        "positions": [
+                            {
+                                "position_title": "Backend Engineer",
+                                "start_date": "2022-01",
+                                "is_current": True,
+                                "bullets": ["Built a payments service"],
+                            }
+                        ],
+                    }
+                ],
+                "source_url": "https://www.linkedin.com/in/alice-example",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["dashboard_url"].endswith("/dashboard/profile")
+        assert body["companies_added"] == 1
+        assert body["positions_added"] == 1
+        assert body["bullets_added"] == 1
+        assert body["education_added"] == 1
+        assert body["projects_added"] == 1
+        assert body["project_bullets_added"] == 1
+        # "Python" 传了两次，去重之后只应该新增两条
+        assert body["skills_added"] == 2
+        assert "full_name" in body["basic_fields_filled"]
+        assert body["has_conflicts"] is False
+
+        db = get_sessionmaker()()
+        try:
+            skills = {s.skill_name for s in db.query(ProfileSkill).all()}
+            assert skills == {"Python", "PostgreSQL"}
+
+            education = db.query(EducationEntry).all()
+            assert len(education) == 1
+            assert education[0].school == "University of Waterloo"
+
+            project = db.query(PersonalProject).filter(PersonalProject.project_name == "JobPilot").one()
+            assert project.company_tag == "Acme Corp"
+
+            company = (
+                db.query(ExperienceEntry)
+                .filter(ExperienceEntry.level == ExperienceLevel.COMPANY, ExperienceEntry.company_name == "Acme Corp")
+                .one()
+            )
+            assert len(company.children) == 1
+        finally:
+            db.close()
+
+        profile_page = client.get("/dashboard/profile")
+        assert "Alice Example" in profile_page.text
+        assert "Python" in profile_page.text
+        assert "JobPilot" in profile_page.text
+
+
+def test_submit_linkedin_profile_second_import_only_fills_blank_and_dedupes():
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        first_payload = {
+            "basic": {"full_name": "Alice Example"},
+            "skills": ["Python"],
+            "companies": [
+                {
+                    "company_name": "Acme Corp",
+                    "positions": [{"position_title": "Backend Engineer", "bullets": ["Built a payments service"]}],
+                }
+            ],
+        }
+        r1 = client.post("/api/linkedin-profile", json=first_payload, headers=headers)
+        assert r1.status_code == 200
+
+        # 第二次导入：姓名已经有值了（不会被覆盖），同一个技能名再传一次不
+        # 应该重复新增，同一条职位下的同一句贡献句也不应该重复新增。
+        second_payload = {
+            "basic": {"full_name": "Someone Else", "target_title": "Staff Engineer"},
+            "skills": ["python"],  # 大小写不同，但本质是同一个技能
+            "companies": [
+                {
+                    "company_name": "acme corp",  # 大小写不同，应该匹配到同一家公司
+                    "positions": [{"position_title": "Backend Engineer", "bullets": ["Built a payments service"]}],
+                }
+            ],
+        }
+        r2 = client.post("/api/linkedin-profile", json=second_payload, headers=headers)
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["companies_added"] == 0
+        assert body2["bullets_added"] == 0
+        assert body2["skills_added"] == 0
+        assert "target_title" in body2["basic_fields_filled"]
+        assert "full_name" not in body2["basic_fields_filled"]
+
+        profile_page = client.get("/dashboard/profile")
+        assert "Alice Example" in profile_page.text
+        assert "Someone Else" not in profile_page.text

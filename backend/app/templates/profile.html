@@ -4,7 +4,37 @@
 <h1>我的画像</h1>
 
 <div class="card">
-  <h2>基本信息</h2>
+  <h2>备注信息</h2>
+  <p class="muted">
+    给 AI 的附加信息，比如自己评价一下自己的优势/劣势、求职偏好等——这段内容会在"生成 JD 匹配分析"时被 AI 参考，
+    体现在优劣势判断里，但<strong>不会</strong>被原样写进任何生成出来的简历正文（简历正文只用下面"基本信息"里的个人简介）。
+  </p>
+  <form method="post" action="/dashboard/profile/notes">
+    <textarea name="additional_notes" rows="4" style="width:100%;" placeholder="比如：擅长从 0 到 1 搭建系统，但缺乏大规模团队管理经验；比较看重能不能远程办公。">{{ profile.additional_notes or '' }}</textarea>
+    <div style="margin-top:12px;"><button type="submit">保存备注</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>上传简历自动建画像</h2>
+  <p class="muted">
+    支持 .pdf / .docx / .txt / .md。如果是按 JobPilot 模板格式写的 .md，会直接规则解析，不需要配置模型；
+    其它格式（或者格式不规范的 .md）走"轻量模型"槽位做 AI 抽取，请先在模型配置页面填好。
+    基本信息/个人总结/技能/教育经历只会填补空白内容，工作经历、独立项目会自动合并去重。
+  </p>
+  <form method="post" action="/dashboard/profile/resume" enctype="multipart/form-data" data-llm-loading="AI 正在解析简历，请稍候…">
+    <input type="file" name="resume_file" accept=".pdf,.docx,.txt,.md" required>
+    <div style="margin-top:12px;"><button type="submit">上传并解析</button></div>
+  </form>
+  <p class="muted" style="margin-top:12px; font-size:13px;">
+    也可以从 LinkedIn 导入：安装 JobPilot 浏览器插件后，在插件侧边栏"添加 LinkedIn profile 到 JobPilot"里粘贴你的
+    LinkedIn 个人主页地址，插件会在你已登录的状态下读取页面内容并一键同步过来（基本信息/技能/教育经历/工作经历/项目经历都会按
+    上面同样的"只填空、自动合并去重"规则处理）。
+  </p>
+</div>
+
+<div class="card">
+  <h2>基本信息（含个人简介）</h2>
   <form method="post" action="/dashboard/profile">
     <label>姓名</label>
     <input type="text" name="full_name" value="{{ profile.full_name or '' }}">
@@ -30,24 +60,32 @@
     <input type="text" name="target_location" value="{{ profile.target_location or '' }}">
     <label>工签/身份说明</label>
     <input type="text" name="work_authorization" value="{{ profile.work_authorization or '' }}">
-    <label>个人总结（一行一条，简历里"个人总结"板块用，不参与 JD 匹配裁剪，每次生成简历都原样带上）</label>
+    <label>个人简介（一行一条，简历里"个人总结"板块用，不参与 JD 匹配裁剪，每次生成简历都原样带上）</label>
     <textarea name="resume_summary" rows="4" style="width:100%;">{{ profile.resume_summary or '' }}</textarea>
-    <label>技能（一行一条，比如"Databases: PostgreSQL, MySQL"）</label>
+    <label>技能描述文本（可选，自由文本，一行一条，比如"Databases: PostgreSQL, MySQL"；下面"Skills"板块的结构化标签会作为补充追加在这段文本之后一起生成到简历里，不会重复）</label>
     <textarea name="skills_text" rows="4" style="width:100%;">{{ profile.skills_text or '' }}</textarea>
     <div style="margin-top:16px;"><button type="submit">保存基本信息</button></div>
   </form>
 </div>
 
 <div class="card">
-  <h2>上传简历自动建画像</h2>
-  <p class="muted">
-    支持 .pdf / .docx / .txt / .md。如果是按 JobPilot 模板格式写的 .md，会直接规则解析，不需要配置模型；
-    其它格式（或者格式不规范的 .md）走"轻量模型"槽位做 AI 抽取，请先在模型配置页面填好。
-    基本信息/个人总结/技能/教育经历只会填补空白内容，工作经历、独立项目会自动合并去重。
-  </p>
-  <form method="post" action="/dashboard/profile/resume" enctype="multipart/form-data" data-llm-loading="AI 正在解析简历，请稍候…">
-    <input type="file" name="resume_file" accept=".pdf,.docx,.txt,.md" required>
-    <div style="margin-top:12px;"><button type="submit">上传并解析</button></div>
+  <h2>Skills（{{ profile_skills|length }} 项）</h2>
+  <p class="muted">对照 LinkedIn 的 Skills 板块，一项一个标签，从 LinkedIn 导入时会自动补充进来，也可以手动增删。</p>
+  <div>
+    {% for s in profile_skills %}
+      <span class="tag" style="display:inline-block; border:1px solid #ddd; border-radius:12px; padding:2px 10px; margin:0 6px 6px 0; font-size:13px;">
+        {{ s.skill_name }}
+        <form method="post" action="/dashboard/profile/skills/{{ s.id }}/delete" style="display:inline;">
+          <button type="submit" class="secondary" style="font-size:11px; padding:0 4px; margin-left:4px;">×</button>
+        </form>
+      </span>
+    {% else %}
+      <p class="muted">还没有结构化技能标签，从 LinkedIn 导入会自动补充，也可以在下面手动新增。</p>
+    {% endfor %}
+  </div>
+  <form method="post" action="/dashboard/profile/skills" style="margin-top:8px;">
+    <input type="text" name="skill_name" placeholder="比如 Python" required>
+    <button type="submit">新增技能</button>
   </form>
 </div>
 
@@ -78,48 +116,6 @@
       <label>结束时间</label>
       <input type="text" name="end_date" placeholder="留空表示至今">
       <label><input type="checkbox" name="is_current" value="1"> 目前在读</label>
-      <div style="margin-top:8px;"><button type="submit">新增</button></div>
-    </form>
-  </details>
-</div>
-
-<div class="card">
-  <h2>独立项目（{{ personal_projects|length }} 个，不挂靠公司的个人/课外项目）</h2>
-  {% for proj in personal_projects %}
-    <div class="position-block">
-      <strong>{{ proj.project_name }}</strong>
-      <span class="muted">({{ proj.start_date or '?' }} ~ {{ proj.end_date or ('至今' if proj.is_current else '?') }})</span>
-      <form method="post" action="/dashboard/profile/projects/{{ proj.id }}/delete" style="display:inline;">
-        <button type="submit" class="secondary" style="font-size:12px; padding:2px 8px;">删除</button>
-      </form>
-      {% for b in proj.bullets %}
-        <div class="bullet">- {{ b.content }}
-          <form method="post" action="/dashboard/profile/project-bullets/{{ b.id }}/delete" style="display:inline;">
-            <button type="submit" class="secondary" style="font-size:11px; padding:0 4px;">删除</button>
-          </form>
-        </div>
-      {% endfor %}
-      <details style="margin-top:6px;">
-        <summary class="muted" style="cursor:pointer; font-size:12px;">新增贡献句</summary>
-        <form method="post" action="/dashboard/profile/projects/{{ proj.id }}/bullets" style="margin-top:6px;">
-          <input type="text" name="content" placeholder="这个项目做了什么" style="width:70%;" required>
-          <button type="submit">新增</button>
-        </form>
-      </details>
-    </div>
-  {% else %}
-    <p class="muted">还没有独立项目，上传简历试试，或者在下面手动新增。</p>
-  {% endfor %}
-  <details style="margin-top:8px;">
-    <summary class="muted" style="cursor:pointer; font-size:13px;">新增独立项目</summary>
-    <form method="post" action="/dashboard/profile/projects" style="margin-top:8px;">
-      <label>项目名称</label>
-      <input type="text" name="project_name" required>
-      <label>起始时间</label>
-      <input type="text" name="start_date" placeholder="2025-01">
-      <label>结束时间</label>
-      <input type="text" name="end_date" placeholder="留空表示至今">
-      <label><input type="checkbox" name="is_current" value="1"> 目前进行中</label>
       <div style="margin-top:8px;"><button type="submit">新增</button></div>
     </form>
   </details>
@@ -172,5 +168,55 @@
       </details>
     </div>
   {% endfor %}
+</div>
+
+<div class="card">
+  <h2>项目经历（{{ personal_projects|length }} 个独立项目，不挂靠公司的个人/课外项目）</h2>
+  {% for proj in personal_projects %}
+    <div class="position-block">
+      <strong>{{ proj.project_name }}</strong>
+      <span class="muted">({{ proj.start_date or '?' }} ~ {{ proj.end_date or ('至今' if proj.is_current else '?') }})</span>
+      {% if proj.company_tag %}<span class="muted">· 关联公司：{{ proj.company_tag }}</span>{% endif %}
+      <form method="post" action="/dashboard/profile/projects/{{ proj.id }}/delete" style="display:inline;">
+        <button type="submit" class="secondary" style="font-size:12px; padding:2px 8px;">删除</button>
+      </form>
+      {% for b in proj.bullets %}
+        <div class="bullet">- {{ b.content }}
+          <form method="post" action="/dashboard/profile/project-bullets/{{ b.id }}/delete" style="display:inline;">
+            <button type="submit" class="secondary" style="font-size:11px; padding:0 4px;">删除</button>
+          </form>
+        </div>
+      {% endfor %}
+      <details style="margin-top:6px;">
+        <summary class="muted" style="cursor:pointer; font-size:12px;">新增贡献句</summary>
+        <form method="post" action="/dashboard/profile/projects/{{ proj.id }}/bullets" style="margin-top:6px;">
+          <input type="text" name="content" placeholder="这个项目做了什么" style="width:70%;" required>
+          <button type="submit">新增</button>
+        </form>
+      </details>
+      <details style="margin-top:6px;">
+        <summary class="muted" style="cursor:pointer; font-size:12px;">编辑关联公司标签</summary>
+        <form method="post" action="/dashboard/profile/projects/{{ proj.id }}/tag" style="margin-top:6px;">
+          <input type="text" name="company_tag" value="{{ proj.company_tag or '' }}" placeholder="比如这个项目其实是在某家公司实习期间做的，填公司名">
+          <button type="submit">保存标签</button>
+        </form>
+      </details>
+    </div>
+  {% else %}
+    <p class="muted">还没有项目经历，上传简历试试，或者在下面手动新增。</p>
+  {% endfor %}
+  <details style="margin-top:8px;">
+    <summary class="muted" style="cursor:pointer; font-size:13px;">新增项目经历</summary>
+    <form method="post" action="/dashboard/profile/projects" style="margin-top:8px;">
+      <label>项目名称</label>
+      <input type="text" name="project_name" required>
+      <label>起始时间</label>
+      <input type="text" name="start_date" placeholder="2025-01">
+      <label>结束时间</label>
+      <input type="text" name="end_date" placeholder="留空表示至今">
+      <label><input type="checkbox" name="is_current" value="1"> 目前进行中</label>
+      <div style="margin-top:8px;"><button type="submit">新增</button></div>
+    </form>
+  </details>
 </div>
 {% endblock %}

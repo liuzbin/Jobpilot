@@ -76,6 +76,15 @@ class ProfileBasic(Base):
     # 逐行输出（见 resume_tailor.build_static_resume_context）。
     resume_summary: Mapped[str | None] = mapped_column(Text)
     skills_text: Mapped[str | None] = mapped_column(Text)
+    # LinkedIn 画像功能新增：给 LLM 的附加信息（自我评价的优势/劣势、求职
+    # 偏好等），不是某段具体经历的事实描述，所以刻意不放进 BASIC_FIELDS
+    # 里那些"简历会原样带上"的静态背景字段——这一条明确只喂给
+    # app.services.scoring 的 JD 匹配打分 LLM 调用做语义参考（体现在
+    # strengths/weaknesses 里），不会出现在任何生成出来的简历正文中。
+    # 走和 resume_summary/skills_text 一样的"表单整体覆盖"逻辑，只是
+    # 单独开一个小表单提交（见 routes_dashboard.profile_update_notes），
+    # 避免和主表单混在一起时不小心被空值覆盖掉。
+    additional_notes: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
@@ -204,6 +213,13 @@ class PersonalProject(Base):
     start_date: Mapped[str | None] = mapped_column(String(20))
     end_date: Mapped[str | None] = mapped_column(String(20))
     is_current: Mapped[bool] = mapped_column(default=False)
+    # LinkedIn 画像功能新增：自由文本标签，用来和 experience_entry 里的某家
+    # 公司做人工关联展示（比如这个独立项目其实是在某家公司实习期间做的）。
+    # 刻意只在这一侧加字段，不改 experience_entry、不建外键——见实施方案
+    # 对应章节：两边各自保留独立的描述文本，这个标签只是方便用户在画像页
+    # 上一眼看出"这个项目和那段工作经历是同一件事"，不参与任何合并/打分/
+    # 简历生成逻辑。
+    company_tag: Mapped[str | None] = mapped_column(String(300))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -231,6 +247,29 @@ class PersonalProjectBullet(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     project: Mapped[PersonalProject] = relationship(back_populates="bullets")
+
+
+class ProfileSkill(Base):
+    """结构化技能列表（LinkedIn 画像功能新增）：对照 LinkedIn Skills 板块的
+    扁平标签结构，每条就是一个技能名，不做分类。单独开一张表而不是塞进
+    `profile_basic.skills_text` 那段自由文本里，是因为这批数据主要来源于
+    LinkedIn 页面抓取——抓取本身就是一份份离散的技能标签，不需要（也不
+    应该）再喂给 LLM 做"分段/分类"这种重活；合并新抓取的技能时按技能名
+    精确去重（大小写不敏感）就够用，和 education_entry/personal_project
+    的合并逻辑是一个路数,成本上比每次都要 LLM 去理解/重排一段自由文本低
+    得多。
+
+    `resume_summary`/`skills_text` 这批"简历上传解析出的自由文本背景信息"
+    不受影响、继续保留；生成简历时这张表的内容作为补充追加在 skills_text
+    派生的技能行之后（见 resume_tailor._build_skills_lines），不会覆盖
+    原有内容，也不会和已经出现在 skills_text 里的技能重复列出。"""
+
+    __tablename__ = "profile_skill"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    skill_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class ResumeTemplate(Base):

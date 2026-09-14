@@ -54,6 +54,7 @@ from app.models.tables import (
     PersonalProject,
     PersonalProjectBullet,
     ProfileBasic,
+    ProfileSkill,
 )
 
 # 贡献句相似度阈值：高于这个值判定为"很可能是同一件事的不同措辞"，需要用户
@@ -89,6 +90,10 @@ BASIC_FIELDS = [
     # 提交整体覆盖 / 简历解析只填空字段"逻辑,不需要单独的合并函数。
     "resume_summary",
     "skills_text",
+    # LinkedIn 画像功能新增，见 ProfileBasic.additional_notes 的表注释。
+    # 复用同一套"整体覆盖"逻辑，但 Dashboard 上走独立的小表单提交
+    # （profile_update_notes），不会和主表单混在一起。
+    "additional_notes",
 ]
 
 
@@ -185,6 +190,9 @@ class MergeResult:
     education_added: int = 0
     projects_added: int = 0
     project_bullets_added: int = 0
+    # LinkedIn 画像功能新增：结构化技能标签（profile_skill 表）的合并统计,
+    # 规则和教育经历/独立项目一样是"精确去重、不算冲突、不用打扰用户"。
+    skills_added: int = 0
 
 
 def _position_label(position: ExperienceEntry) -> str:
@@ -430,22 +438,51 @@ def _merge_education_entries(db: Session, entries_in: list[dict]) -> int:
     return added
 
 
+def _merge_profile_skills(db: Session, skill_names_in: list[str]) -> int:
+    """结构化技能标签（LinkedIn 画像功能新增）按技能名精确去重（大小写/
+    首尾空白不敏感）合并——见 ProfileSkill 表注释，这批数据的来源本身就是
+    离散的标签，不需要模糊匹配。"""
+    existing = db.query(ProfileSkill).all()
+    existing_names = {_norm(s.skill_name) for s in existing}
+    max_order = max([s.order_index for s in existing], default=-1)
+
+    added = 0
+    for skill_name in skill_names_in:
+        skill_name = (skill_name or "").strip()
+        if not skill_name or _norm(skill_name) in existing_names:
+            continue
+        max_order += 1
+        db.add(ProfileSkill(skill_name=skill_name, order_index=max_order))
+        existing_names.add(_norm(skill_name))
+        added += 1
+    if added:
+        db.commit()
+    return added
+
+
 def _merge_personal_projects(db: Session, projects_in: list[dict]) -> tuple[int, int]:
     """独立项目按项目名精确匹配（标准化后完全一致）合并——不像公司下的职位
     那样做时间重叠+相似度的模糊匹配，是刻意收窄的范围：独立项目数量通常
     很少，精确匹配已经能覆盖"重复上传同一份简历"这个最常见的场景，模糊
     匹配那一套机制这里暂时不需要（见 docs/DEVELOPMENT_LOG.md 对应章节）。
-    贡献句按精确文本去重，逻辑和公司经历下的贡献句去重一致。"""
+    贡献句按精确文本去重，逻辑和公司经历下的贡献句去重一致。
+
+    `company_tag`（LinkedIn 画像功能新增，见 PersonalProject 表注释）走
+    "只填空"逻辑：新建项目时如果传了就直接带上；项目已存在时只有在现有
+    标签为空、且新传入的值非空时才补上，不会用新值覆盖用户已经手动填过
+    的标签。"""
     existing = db.query(PersonalProject).all()
     existing_index = {_norm(p.project_name): p for p in existing}
     max_order = max([p.order_index for p in existing], default=-1)
 
     projects_added = 0
     bullets_added = 0
+    dirty = False
     for project_in in projects_in:
         project_name = (project_in.get("project_name") or "").strip()
         if not project_name:
             continue
+        incoming_tag = (project_in.get("company_tag") or "").strip() or None
         project = existing_index.get(_norm(project_name))
         if project is None:
             max_order += 1
@@ -454,12 +491,17 @@ def _merge_personal_projects(db: Session, projects_in: list[dict]) -> tuple[int,
                 start_date=project_in.get("start_date"),
                 end_date=project_in.get("end_date"),
                 is_current=bool(project_in.get("is_current", False)),
+                company_tag=incoming_tag,
                 order_index=max_order,
             )
             db.add(project)
             db.flush()
             existing_index[_norm(project_name)] = project
             projects_added += 1
+            dirty = True
+        elif incoming_tag and not project.company_tag:
+            project.company_tag = incoming_tag
+            dirty = True
 
         existing_bullet_texts = {_norm(b.content) for b in project.bullets}
         max_bullet_order = max([b.order_index for b in project.bullets], default=-1)
@@ -471,8 +513,9 @@ def _merge_personal_projects(db: Session, projects_in: list[dict]) -> tuple[int,
             db.add(PersonalProjectBullet(project_id=project.id, content=bullet_text, order_index=max_bullet_order))
             existing_bullet_texts.add(_norm(bullet_text))
             bullets_added += 1
+            dirty = True
 
-    if projects_added or bullets_added:
+    if dirty:
         db.commit()
     return projects_added, bullets_added
 
@@ -490,6 +533,9 @@ def merge_parsed_experience(db: Session, parsed: dict) -> MergeResult:
 
     if parsed.get("projects"):
         result.projects_added, result.project_bullets_added = _merge_personal_projects(db, parsed["projects"])
+
+    if parsed.get("skills"):
+        result.skills_added = _merge_profile_skills(db, parsed["skills"])
 
     existing_companies = (
         db.query(ExperienceEntry).filter(ExperienceEntry.level == ExperienceLevel.COMPANY).all()
@@ -870,7 +916,7 @@ def update_personal_project(db: Session, project_id: int, fields_in: dict) -> Pe
     project = db.get(PersonalProject, project_id)
     if project is None:
         raise ValueError(f"独立项目不存在：id={project_id}")
-    for key in ("project_name", "start_date", "end_date"):
+    for key in ("project_name", "start_date", "end_date", "company_tag"):
         if key in fields_in:
             value = (fields_in[key] or "").strip() or None
             setattr(project, key, value)
@@ -923,5 +969,36 @@ def delete_personal_project_bullet(db: Session, bullet_id: int) -> bool:
     if bullet is None:
         return False
     db.delete(bullet)
+    db.commit()
+    return True
+
+
+# ---------- 结构化技能标签的手动增删（LinkedIn 画像功能新增） ----------
+
+
+def get_profile_skills(db: Session) -> list[ProfileSkill]:
+    return db.query(ProfileSkill).order_by(ProfileSkill.order_index, ProfileSkill.id).all()
+
+
+def add_profile_skill(db: Session, skill_name: str) -> ProfileSkill:
+    skill_name = (skill_name or "").strip()
+    if not skill_name:
+        raise ValueError("技能名不能为空")
+    existing = db.query(ProfileSkill).all()
+    if _norm(skill_name) in {_norm(s.skill_name) for s in existing}:
+        raise ValueError(f"技能「{skill_name}」已经存在")
+    max_order = max([s.order_index for s in existing], default=-1)
+    skill = ProfileSkill(skill_name=skill_name, order_index=max_order + 1)
+    db.add(skill)
+    db.commit()
+    db.refresh(skill)
+    return skill
+
+
+def delete_profile_skill(db: Session, skill_id: int) -> bool:
+    skill = db.get(ProfileSkill, skill_id)
+    if skill is None:
+        return False
+    db.delete(skill)
     db.commit()
     return True

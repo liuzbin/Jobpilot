@@ -49,16 +49,19 @@ from app.services.profile_service import (
     add_personal_project,
     add_personal_project_bullet,
     add_position,
+    add_profile_skill,
     delete_bullet,
     delete_company,
     delete_education_entry,
     delete_personal_project,
     delete_personal_project_bullet,
     delete_position,
+    delete_profile_skill,
     get_education_entries,
     get_experience_tree,
     get_or_create_profile_basic,
     get_personal_projects,
+    get_profile_skills,
     merge_parsed_experience,
     resolve_bullet_conflict,
     resolve_position_field,
@@ -146,9 +149,19 @@ def profile_page(request: Request, db: Session = Depends(get_db)) -> HTMLRespons
             "experience": experience,
             "education_entries": get_education_entries(db),
             "personal_projects": get_personal_projects(db),
+            "profile_skills": get_profile_skills(db),
             **_flash_params(request),
         },
     )
+
+
+@router.post("/profile/notes", dependencies=[Depends(require_local_browser)])
+def profile_update_notes(db: Session = Depends(get_db), additional_notes: str = Form("")) -> RedirectResponse:
+    """备注信息单独开一个小表单提交（见 ProfileBasic.additional_notes 的
+    表注释），不和下面的基本信息大表单混在一起——避免两个表单其中一个没
+    带上另一个的字段时,被 update_profile_basic 的"整体覆盖"逻辑误清空。"""
+    update_profile_basic(db, {"additional_notes": additional_notes or None})
+    return _redirect_with_flash("/dashboard/profile", "备注信息已保存")
 
 
 @router.post("/profile", dependencies=[Depends(require_local_browser)])
@@ -248,6 +261,8 @@ def profile_upload_resume(
         extra_bits.append(f"{result.education_added} 条教育经历")
     if result.projects_added or result.project_bullets_added:
         extra_bits.append(f"{result.projects_added} 个独立项目（{result.project_bullets_added} 条贡献句）")
+    if result.skills_added:
+        extra_bits.append(f"{result.skills_added} 项技能标签")
     extra_msg = f"，另外补充了{'、'.join(extra_bits)}" if extra_bits else ""
 
     msg = (
@@ -512,6 +527,38 @@ def profile_add_project_bullet(project_id: int, db: Session = Depends(get_db), c
 def profile_delete_project_bullet(bullet_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
     delete_personal_project_bullet(db, bullet_id)
     return _redirect_with_flash("/dashboard/profile", "已删除项目贡献句")
+
+
+@router.post("/profile/projects/{project_id}/tag", dependencies=[Depends(require_local_browser)])
+def profile_update_project_tag(
+    project_id: int, db: Session = Depends(get_db), company_tag: str = Form("")
+) -> RedirectResponse:
+    """独立项目的"关联公司"标签单独开一个小表单提交，只更新这一个字段
+    （见 profile_service.update_personal_project 的 company_tag 分支），
+    不影响项目名称/时间这些字段。"""
+    try:
+        update_personal_project(db, project_id, {"company_tag": company_tag})
+    except ValueError:
+        raise HTTPException(status_code=404, detail="project not found")
+    return _redirect_with_flash("/dashboard/profile", "已更新关联标签")
+
+
+# ---------- 结构化技能标签（LinkedIn 画像功能新增） ----------
+
+
+@router.post("/profile/skills", dependencies=[Depends(require_local_browser)])
+def profile_add_skill(db: Session = Depends(get_db), skill_name: str = Form(...)) -> RedirectResponse:
+    try:
+        add_profile_skill(db, skill_name)
+    except ValueError as exc:
+        return _redirect_with_flash("/dashboard/profile", str(exc), error=True)
+    return _redirect_with_flash("/dashboard/profile", "已新增技能")
+
+
+@router.post("/profile/skills/{skill_id}/delete", dependencies=[Depends(require_local_browser)])
+def profile_delete_skill(skill_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+    delete_profile_skill(db, skill_id)
+    return _redirect_with_flash("/dashboard/profile", "已删除技能")
 
 
 # ---------- MD 简历模板库（打磨阶段后新增） ----------

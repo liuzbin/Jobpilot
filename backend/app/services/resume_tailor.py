@@ -47,6 +47,7 @@ from app.services.profile_service import (
     format_date_range,
     get_or_create_profile_basic,
     get_personal_projects,
+    get_profile_skills,
 )
 from app.services.profile_service import get_education_entries as _get_education_entries
 from app.services.resume_pdf import (
@@ -540,6 +541,24 @@ def _split_lines(text: str | None) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def _build_skills_lines(db: Session, profile) -> list[str]:
+    """简历"技能"板块的最终行列表：先是 `skills_text` 那段自由文本原样
+    按行拆出来的内容（完全不变，向后兼容），后面追加一行由结构化技能标签
+    （profile_skill 表，见该表注释——LinkedIn 画像功能新增）拼成的补充行,
+    只有 `skills_text` 里明显没提到过的标签才会被列进这一行（大小写不
+    敏感的子串匹配），避免同一个技能在简历里重复出现两次。一个都没有
+    补充时不加这一行，行为和之前完全一样。"""
+    lines = _split_lines(profile.skills_text)
+    skill_names = [s.skill_name for s in get_profile_skills(db)]
+    if not skill_names:
+        return lines
+    existing_blob = (profile.skills_text or "").strip().lower()
+    new_names = [name for name in skill_names if name.strip().lower() not in existing_blob]
+    if new_names:
+        lines.append(", ".join(new_names))
+    return lines
+
+
 def _build_static_sections(db: Session) -> tuple[list[dict], list[dict]]:
     """独立项目 / 教育经历这两块"静态背景信息"——见 profile_service.py 里
     PersonalProject/EducationEntry 的说明，不参与 JD 关键词匹配/K 值裁剪，
@@ -759,7 +778,7 @@ def confirm_and_finalize(
             "linkedin_url": profile.linkedin_url,
         },
         "summary": _split_lines(profile.resume_summary),
-        "skills": _split_lines(profile.skills_text),
+        "skills": _build_skills_lines(db, profile),
         "experience": [
             {
                 "company_name": position.parent.company_name if position.parent else None,
