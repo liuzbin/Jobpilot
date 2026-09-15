@@ -26,6 +26,7 @@ from app.services.resume_tailor import (
     find_missing_keywords,
     generate_extension_suggestions,
     rewrite_hit_bullets,
+    select_bullets_by_quota,
     select_keywords_to_extend,
     validate_item_facts,
 )
@@ -91,6 +92,180 @@ def test_find_hit_bullets_reports_matched_keywords(db_session):
     assert len(hits) == 1
     assert hits[0]["matched_keywords"] == ["Hadoop"]
     assert hits[0]["company_name"] == "Acme Corp"
+
+
+# ---------- 品控：简历板块的格式配额（打磨阶段用户反馈第 3 点） ----------
+
+
+def _seed_two_positions_with_bullets(db_session):
+    """两段工作经历，第一段（Data Engineer）4 条 bullet（含 2 条能命中 JD
+    关键词的),第二段（Backend Engineer）2 条 bullet（都命中不了)——专门用来
+    验证配额分配"按相关度排名决定配额大小,但配额只是上限,真实内容不够时
+    不编造"这条规则。"""
+    parsed = {
+        "basic": {},
+        "companies": [
+            {
+                "company_name": "Acme Corp",
+                "positions": [
+                    {
+                        "position_title": "Data Engineer",
+                        "project_name": "Big Data Platform",
+                        "start_date": "2022-01",
+                        "end_date": "2023-01",
+                        "is_current": False,
+                        "bullets": [
+                            "Built a Hadoop-based ETL pipeline",
+                            "Optimized Spark jobs for batch processing",
+                            "Wrote internal documentation",
+                            "Mentored two junior engineers",
+                        ],
+                    }
+                ],
+            },
+            {
+                "company_name": "Beta Inc",
+                "positions": [
+                    {
+                        "position_title": "Backend Engineer",
+                        "project_name": "Payments",
+                        "start_date": "2023-02",
+                        "end_date": None,
+                        "is_current": True,
+                        "bullets": ["Maintained legacy billing service", "Fixed production incidents"],
+                    }
+                ],
+            },
+        ],
+    }
+    merge_parsed_experience(db_session, parsed)
+    positions = db_session.query(ExperienceEntry).filter(ExperienceEntry.level == ExperienceLevel.POSITION).all()
+    by_title = {p.position_title: p for p in positions}
+    data_eng, backend_eng = by_title["Data Engineer"], by_title["Backend Engineer"]
+
+    keyword_map = {
+        "Built a Hadoop-based ETL pipeline": ["Hadoop", "ETL"],
+        "Optimized Spark jobs for batch processing": ["Spark"],
+    }
+    for position in (data_eng, backend_eng):
+        for bullet in position.bullets:
+            bullet.keywords = keyword_map.get(bullet.content, [])
+    db_session.commit()
+    return data_eng.id, backend_eng.id
+
+
+def test_bullet_quota_for_rank_uses_schedule_then_falls_back_to_last_value():
+    from app.services.resume_tailor import _bullet_quota_for_rank
+
+    assert _bullet_quota_for_rank(0) == 3
+    assert _bullet_quota_for_rank(1) == 3
+    assert _bullet_quota_for_rank(2) == 2
+    assert _bullet_quota_for_rank(5) == 2  # 第 4 段及以后沿用配额表最后一档
+
+
+def test_select_bullets_by_quota_ranks_by_relevance_and_keeps_original_position_order(db_session):
+    data_eng_id, backend_eng_id = _seed_two_positions_with_bullets(db_session)
+    positions = [db_session.get(ExperienceEntry, data_eng_id), db_session.get(ExperienceEntry, backend_eng_id)]
+
+    selected = select_bullets_by_quota(["Hadoop", "Spark"], positions)
+
+    # Data Engineer 命中了 2 个关键词，相关度排第一，配额 3；它只有 4 条真实
+    # bullet，命中的 2 条必然入选，配额还剩 1 条从零命中的 2 条里按原始顺序
+    # （bullet_id 升序）取一条。Backend Engineer 零命中排第二，配额本该是 3，
+    # 但它总共只有 2 条真实 bullet——配额只是上限，不会为了凑数而编造。
+    data_eng_items = [item for item in selected if item["experience_entry_id"] == data_eng_id]
+    backend_items = [item for item in selected if item["experience_entry_id"] == backend_eng_id]
+    assert len(data_eng_items) == 3
+    assert len(backend_items) == 2  # 配额 3 但只有 2 条真实内容，如实全部展示，不编造第 3 条
+
+    matched_summaries = {item["original_content"] for item in data_eng_items if item["matched_keywords"]}
+    assert matched_summaries == {"Built a Hadoop-based ETL pipeline", "Optimized Spark jobs for batch processing"}
+
+    # 展示顺序沿用调用方传入的 positions 原始顺序（Data Engineer 在前），
+    # 不按相关度排名重新排序——相关度只决定配额大小。
+    assert [item["experience_entry_id"] for item in selected] == [data_eng_id] * 3 + [backend_eng_id] * 2
+
+
+def test_select_bullets_by_quota_never_fabricates_when_real_content_is_short(db_session):
+    position_id = _seed_experience(db_session)  # 只有 1 条真实 bullet
+    position = db_session.get(ExperienceEntry, position_id)
+    selected = select_bullets_by_quota(["Spark"], [position])  # 完全零命中，配额 3
+    assert len(selected) == 1  # 真实内容只有 1 条，绝不编造凑到 3 条
+    assert selected[0]["original_content"] == position.bullets[0].content
+
+
+# ---------- 品控：独立项目按 JD 相关度选价值最高的几个（打磨阶段用户反馈第 3 点） ----------
+
+
+def test_select_top_projects_keeps_all_when_within_top_n(db_session):
+    from app.services.profile_service import add_personal_project
+    from app.services.resume_tailor import PROJECT_TOP_N, _select_top_projects
+
+    p1 = add_personal_project(db_session, "Solo Project")
+    assert PROJECT_TOP_N == 2
+    assert [p.id for p in _select_top_projects([p1], [])] == [p1.id]
+
+
+def test_select_top_projects_picks_highest_keyword_overlap_and_keeps_original_order(db_session):
+    from app.services.profile_service import add_personal_project, add_personal_project_bullet
+    from app.services.resume_tailor import _select_top_projects
+
+    irrelevant = add_personal_project(db_session, "Cooking Blog")
+    add_personal_project_bullet(db_session, irrelevant.id, "Wrote recipes and food photography tips")
+
+    relevant_a = add_personal_project(db_session, "Streaming Pipeline")
+    add_personal_project_bullet(db_session, relevant_a.id, "Built a Kafka and Flink streaming pipeline")
+
+    relevant_b = add_personal_project(db_session, "Vector Search Bot")
+    add_personal_project_bullet(db_session, relevant_b.id, "Built a RAG system using Kafka for event ingestion")
+
+    jd_keywords_normalized = ["kafka", "rag"]
+    selected = _select_top_projects([irrelevant, relevant_a, relevant_b], jd_keywords_normalized)
+
+    assert len(selected) == 2
+    selected_ids = {p.id for p in selected}
+    assert irrelevant.id not in selected_ids  # 和 JD 完全不沾边的项目被挤出前 2
+    assert selected_ids == {relevant_a.id, relevant_b.id}
+    # 展示顺序沿用原始顺序，不按分数重排
+    assert [p.id for p in selected] == [relevant_a.id, relevant_b.id]
+
+
+def test_select_top_bullets_caps_to_quota_by_relevance(db_session):
+    from app.services.profile_service import add_personal_project, add_personal_project_bullet
+    from app.services.resume_tailor import _select_top_bullets
+
+    project = add_personal_project(db_session, "Data Platform")
+    b1 = add_personal_project_bullet(db_session, project.id, "Wrote onboarding documentation")
+    b2 = add_personal_project_bullet(db_session, project.id, "Used Kafka for ingestion")
+    b3 = add_personal_project_bullet(db_session, project.id, "Used Spark for batch processing")
+
+    selected = _select_top_bullets([b1, b2, b3], ["kafka", "spark"], top_n=2)
+    assert {b.id for b in selected} == {b2.id, b3.id}
+    assert [b.id for b in selected] == [b2.id, b3.id]  # 保持原始顺序展示
+
+
+# ---------- 品控：语气/格式护栏——清理中括号引用标记 ----------
+
+
+def test_strip_citation_artifacts_removes_cite_style_brackets():
+    from app.services.resume_tailor import _strip_citation_artifacts
+
+    assert _strip_citation_artifacts("Improved latency by 20% [cite: 1]") == "Improved latency by 20%"
+    assert _strip_citation_artifacts("Reduced RTO to 5 minutes [3]") == "Reduced RTO to 5 minutes"
+
+
+def test_strip_citation_artifacts_leaves_normal_parentheses_untouched():
+    from app.services.resume_tailor import _strip_citation_artifacts
+
+    text = "Reduced Recovery Time Objective (RTO) to under 5 minutes"
+    assert _strip_citation_artifacts(text) == text  # 技术缩写用的括号不应该被误删
+
+
+def test_strip_citation_artifacts_handles_none_and_empty():
+    from app.services.resume_tailor import _strip_citation_artifacts
+
+    assert _strip_citation_artifacts(None) is None
+    assert _strip_citation_artifacts("") == ""  # 保持和输入一样的假值，不强行转换成 None
 
 
 def test_select_keywords_to_extend_k0_returns_empty():
@@ -259,7 +434,15 @@ def test_build_resume_draft_guardrail_accepts_clean_content_after_successful_ret
 
 def test_build_resume_draft_drops_extension_suggestion_that_fails_guardrail_twice(db_session):
     """延伸建议这边没有"真实原文"可以回退，两次都没通过校验就必须整条丢弃，
-    不能出现在待确认列表里交给用户。"""
+    不能出现在待确认列表里交给用户。
+
+    这条 JD 的关键词（Spark）和画像里唯一那条 bullet 的关键词（Hadoop/ETL）
+    完全不重合——品控改动之前，这种"零命中"场景下 build_resume_draft 完全
+    跳过 rewrite_hit_bullets（find_hit_bullets 返回空列表）；品控改动后
+    （select_bullets_by_quota 保证每段工作经历都固定出现、不再是"命中才
+    出现"），即使零命中也会选中这条真实 bullet 走一遍重写+护栏校验，所以
+    这里比改动前多预置一个 heavy 响应（命中项重写）和一个 light 响应
+    （命中项的批量校验）。"""
     position_id = _seed_experience(db_session)
     jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Spark experience.")
 
@@ -267,6 +450,7 @@ def test_build_resume_draft_drops_extension_suggestion_that_fails_guardrail_twic
         responses=[
             {"required_years": None, "required_education": None, "required_clearance": False,
              "plus_skills": [], "core_responsibilities": [], "key_skills": ["Spark"]},
+            {"results": [{"consistent": True}]},  # 品控新增：配额兜底选中的命中项批量校验（零命中，文本干净）
             {"results": [{"consistent": True}]},  # 延伸建议批量校验：规则层单独拦下
             {"results": [{"consistent": True}]},  # 重试后单条复核：规则层还是拦下
         ]
@@ -283,7 +467,11 @@ def test_build_resume_draft_drops_extension_suggestion_that_fails_guardrail_twic
             }
         ]
     }
-    heavy_fake = FakeLLMClient(responses=[fabricated_suggestion, fabricated_suggestion])
+    # 品控新增：第一个响应对应零命中兜底选中的那条真实 bullet 的重写（这里
+    # 直接返回真实原文措辞，保证不会意外触发命中项这边的护栏重试，让测试
+    # 只聚焦延伸建议这条路径本身要验证的行为）。
+    clean_hit_rewrite = {"rewritten": [{"action_summary": "Built ETL pipeline", "result_summary": "Reduced latency by 18%"}]}
+    heavy_fake = FakeLLMClient(responses=[clean_hit_rewrite, fabricated_suggestion, fabricated_suggestion])
 
     draft = build_resume_draft(db_session, jd.id, 10, jd_parse_fake, heavy_fake)
     assert draft.suggestions == []
@@ -622,8 +810,10 @@ def test_regenerate_resume_pdf_unknown_template_id_raises_and_keeps_old_state(db
 
 
 def test_confirm_and_finalize_includes_static_sections_in_resume_json(db_session):
-    """个人总结/技能/教育经历/独立项目这些"静态背景信息"应该原样进
-    resume_json，且不受 K 值/关键词命中逻辑影响。"""
+    """个人总结/技能/教育经历这些"静态背景信息"应该原样进 resume_json，
+    且不受 K 值/关键词命中逻辑影响。独立项目这一版新增了按 JD 相关度选前
+    `PROJECT_TOP_N` 个的展示层筛选（见 test_confirm_and_finalize_caps_projects_by_jd_relevance），
+    这里只有 1 个项目，天然不触发筛选，行为和以前完全一样。"""
     from app.services.profile_service import (
         add_education_entry,
         add_personal_project,
@@ -650,6 +840,41 @@ def test_confirm_and_finalize_includes_static_sections_in_resume_json(db_session
     assert resume_json["projects"][0]["bullets"] == ["Built a thing"]
     assert "Line one" in resume_version.markdown_text
     assert "Side Bot" in resume_version.markdown_text
+
+
+def test_confirm_and_finalize_caps_projects_by_jd_relevance(db_session):
+    """品控（打磨阶段用户反馈第 3 点）端到端验证：画像里有 3 个独立项目时，
+    生成简历只展示和这条 JD 关键词相关度最高的 2 个，且每个项目最多展示 2
+    条 bullet——jd.parsed_meta 里的 key_skills/plus_skills 要能正确一路
+    传到 _build_static_sections，不是只在单元测试里对，实际接线也要对。"""
+    from app.services.profile_service import add_personal_project, add_personal_project_bullet
+
+    position_id = _seed_experience(db_session)
+
+    cooking = add_personal_project(db_session, "Cooking Blog")
+    add_personal_project_bullet(db_session, cooking.id, "Wrote recipes and food photography tips")
+
+    streaming = add_personal_project(db_session, "Streaming Pipeline")
+    add_personal_project_bullet(db_session, streaming.id, "Built a Kafka ingestion layer")
+    add_personal_project_bullet(db_session, streaming.id, "Used Flink for stream processing")
+    add_personal_project_bullet(db_session, streaming.id, "Wrote unrelated onboarding notes")
+
+    rag_bot = add_personal_project(db_session, "RAG Bot")
+    add_personal_project_bullet(db_session, rag_bot.id, "Built a RAG system with Kafka for event ingestion")
+
+    jd = create_jd(db_session, company="Beta", title="Eng", description_raw="Need Kafka and Flink experience.")
+    jd.parsed_meta = {"key_skills": ["Kafka", "Flink"], "plus_skills": []}
+    db_session.commit()
+
+    hit_items = find_hit_bullets(["Hadoop"], [db_session.get(ExperienceEntry, position_id)])
+    resume_version = confirm_and_finalize(db_session, jd.id, 0, hit_items, [])
+
+    project_names = {p["project_name"] for p in resume_version.resume_json["projects"]}
+    assert project_names == {"Streaming Pipeline", "RAG Bot"}  # Cooking Blog 被挤出前 2
+
+    streaming_json = next(p for p in resume_version.resume_json["projects"] if p["project_name"] == "Streaming Pipeline")
+    assert len(streaming_json["bullets"]) == 2  # 配额封顶 2 条，不是全部 3 条
+    assert "Wrote unrelated onboarding notes" not in streaming_json["bullets"]
 
 
 def test_confirm_and_finalize_appends_profile_skills_not_already_in_skills_text(db_session):

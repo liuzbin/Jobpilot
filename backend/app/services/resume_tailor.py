@@ -23,6 +23,18 @@ Phase 2：简历重制——见实施方案 4/5.3。核心是把 K 值语义落�
 `confirm_and_finalize` 产出结构化 JSON + Markdown 预览之后，还会调用
 `app.services.resume_pdf` 按 `style_id` 渲染一份 PDF 落盘（见 5.3 的"生成
 管线"）；PDF 渲染失败不影响 JSON/Markdown 的可用性，只是当次没有 PDF 下载。
+
+打磨阶段用户反馈第 3 点新增"品控"：K 值和"每段工作经历该出现几条 bullet"
+是两个独立维度——K 值只管要不要为缺失关键词构造延伸建议；不管 JD 关键词
+命中了多少条，每段公司经历都应该固定出现、bullet 数量应该稳定，不能因为
+命中数量随 JD 内容剧烈波动（甚至因为零命中而整段消失）。落地成
+`select_bullets_by_quota`（按相关度排名分配 3/3/2 配额，配额只是上限，
+真实内容不够时绝不编造凑数）和独立项目的"选价值最高的 2 个、每个最多 2
+条 bullet"筛选（`_select_top_projects`/`_select_top_bullets`，纯本地
+关键词子串匹配，不额外消耗 LLM 调用）。同一批改动还给 LLM 输出加了语气/
+格式护栏（不允许括号解释、不允许方括号引用标记、必须保留具体指标），
+见 REWRITE_HITS_SYSTEM_PROMPT/EXTENSION_SUGGESTION_SYSTEM_PROMPT 和
+`_strip_citation_artifacts` 的规则兜底。
 """
 
 from __future__ import annotations
@@ -72,6 +84,35 @@ class JDNotFoundError(RuntimeError):
 
 class ResumeVersionNotFoundError(RuntimeError):
     pass
+
+
+# ---------- 品控：语气/格式护栏（打磨阶段用户反馈第 3 点） ----------
+#
+# 用户参考自己平时用 ChatBot 生成简历的提示词，提出几条"品控"要求：语气稳重
+# 专业、不允许括号解释、不允许中括号引用标记（比如 AI 工具常见的 [cite: 1]
+# 这种未清理干净的引用痕迹）、有具体指标必须保留。前两条主要靠 Prompt 约束
+# LLM（见下面 REWRITE_HITS_SYSTEM_PROMPT/EXTENSION_SUGGESTION_SYSTEM_PROMPT
+# 新增的说明），但"中括号引用标记"这种典型的 AI 生成痕迹值得再加一道确定性
+# 的规则兜底——不依赖 LLM 是否严格遵守指令，生成的文本里但凡出现形如
+# `[数字]`、`[cite: 1]`、`[来源: xxx]` 这类中括号标记，一律原样删除。
+# 之所以只清理"看起来像引用标记"的中括号内容（含数字，或者含 cite/ref/source/
+# 来源/引用 这些词），而不是所有小括号/中括号，是因为真实的技术缩写/型号
+# 有时也会用括号（比如 "(RTO)"、"[Beta]" 这种项目代号），不应该被这道兜底
+# 规则误删。
+_CITATION_ARTIFACT_PATTERN = re.compile(
+    r"[\[［]\s*(?:[^\[\]［］]*\d[^\[\]［］]*|(?:cite|ref|reference|source|来源|引用)[^\[\]［］]*)\s*[\]］]",
+    re.IGNORECASE,
+)
+
+
+def _strip_citation_artifacts(text: str | None) -> str | None:
+    if not text:
+        return text
+    cleaned = _CITATION_ARTIFACT_PATTERN.sub("", text)
+    # 删掉中括号标记后可能留下多余的空格（比如 "85%  ." 或者两个空格连在一起），
+    # 顺手清理掉，避免看得出"这里被删过东西"的痕迹。
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned or None
 
 
 # ---------- 事实字段护栏校验（见实施方案 5.3：v1 就定好、任何 K 值下都不放松） ----------
@@ -300,6 +341,107 @@ def find_hit_bullets(jd_keywords: list[str], positions: list[ExperienceEntry]) -
     return hits
 
 
+# ---------- 简历板块的格式配额（品控，独立于 K 值） ----------
+#
+# 用户反馈原话："K值和固定bullet数量是两码事，K值是分析JD获得JD最偏好的
+# 前几个点，我固定的bullet只是为了规范好简历的格式稳定"——这两件事刻意
+# 分开处理：K 值继续只管"要不要为缺失关键词构造延伸建议"（select_keywords_to_extend
+# 完全不变）；这里新增的配额规则只管"每段工作经历该出现几条真实 bullet"这个
+# 格式契约，不管 JD 关键词命中了多少条，都不应该出现"命中越多显示越多、
+# 命中为零整段公司经历从简历里消失"这种随 JD 内容剧烈波动的观感。
+#
+# 配额来自用户提供的参考 prompt："最相关 3 点，次相关 3 点，再次 2 点"——
+# 按对 JD 的相关度给工作经历排名后分配；这里按排名索引（0-based）取值，
+# 画像里的公司数量不一定正好是 3 家，第 4 段及以后沿用配额表最后一档，
+# 不假设画像固定只有 3 段工作经历。
+BULLET_QUOTA_SCHEDULE = [3, 3, 2]
+
+
+def _bullet_quota_for_rank(rank: int) -> int:
+    if rank < len(BULLET_QUOTA_SCHEDULE):
+        return BULLET_QUOTA_SCHEDULE[rank]
+    return BULLET_QUOTA_SCHEDULE[-1]
+
+
+def _score_all_bullets(jd_keywords: list[str], positions: list[ExperienceEntry]) -> list[dict]:
+    """和 find_hit_bullets 结构完全一样，但覆盖每一条 bullet（含零命中的）。
+    配额选择需要知道"这条 bullet 有多贴近 JD"这个连续的相关度信号，而不
+    只是 find_hit_bullets 那种命中/未命中的二元判断——零命中的 bullet 也
+    需要参与排序，保证真实内容不够填满配额时仍有内容可用，不必回退到
+    编造。"""
+    jd_keyword_set = {_norm_keyword(kw) for kw in jd_keywords}
+    scored: list[dict] = []
+    for position in positions:
+        for bullet in position.bullets:
+            matched = [kw for kw in (bullet.keywords or []) if _norm_keyword(kw) in jd_keyword_set]
+            scored.append(
+                {
+                    "experience_entry_id": position.id,
+                    "bullet_id": bullet.id,
+                    "company_name": position.parent.company_name if position.parent else None,
+                    "position_title": position.position_title,
+                    "project_name": position.project_name,
+                    "matched_keywords": matched,
+                    "keywords": bullet.keywords or [],
+                    "action_summary": bullet.action_summary or bullet.content,
+                    "result_summary": bullet.result_summary,
+                    "original_content": bullet.content,
+                }
+            )
+    return scored
+
+
+def select_bullets_by_quota(
+    jd_keywords: list[str],
+    positions: list[ExperienceEntry],
+    quota_schedule: list[int] | None = None,
+) -> list[dict]:
+    """品控：保证画像里每一段公司经历（B 层 position）在生成的简历里都固定
+    出现，按对 JD 的相关度排名分配 bullet 配额（默认 3/3/2，见 BULLET_QUOTA_SCHEDULE）。
+    配额只是"最多显示几条"的上限——某段经历真实 bullet 数量本来就不够配额时，
+    有几条真实内容就用几条，绝不为了凑数而编造（这一条底线和 5.3 节的事实
+    护栏是一致的）。同一段经历内部，真实 bullet 按"命中的 JD 关键词数量"从
+    高到低排序，数量相同时保持画像里原有的顺序（bullet_id 升序，和入库顺序
+    一致，不受相关度排序影响，方便复现）。
+
+    相关度排名只用来决定配额大小，不改变最终简历里工作经历板块的展示顺序——
+    返回列表按调用方传入的 `positions` 原始顺序（一般是查询出来的顺序，和
+    简历里"应该按时间顺序阅读"的习惯保持一致）逐段拼接，避免"越相关排越
+    靠前"和"简历该按时间顺序读"这两条约定互相打架。
+
+    返回的结构和 find_hit_bullets 完全一样（同一批字段），可以直接喂给
+    rewrite_hit_bullets 复用润色+护栏校验那一整套逻辑，不需要额外分支；
+    find_hit_bullets 本身保持不变，继续给需要"只看真正命中"的调用方使用
+    （比如直接构造 hit_items 的测试用例）。
+    """
+    quota_schedule = quota_schedule or BULLET_QUOTA_SCHEDULE
+    scored = _score_all_bullets(jd_keywords, positions)
+
+    by_position: dict[int, list[dict]] = {}
+    for item in scored:
+        by_position.setdefault(item["experience_entry_id"], []).append(item)
+
+    def _position_score(position: ExperienceEntry) -> int:
+        return sum(len(item["matched_keywords"]) for item in by_position.get(position.id, []))
+
+    rank_by_position_id = {
+        position.id: rank
+        for rank, (_, position) in enumerate(
+            sorted(enumerate(positions), key=lambda pair: (-_position_score(pair[1]), pair[0]))
+        )
+    }
+
+    selected: list[dict] = []
+    for position in positions:
+        quota = _bullet_quota_for_rank(rank_by_position_id[position.id])
+        items = sorted(
+            by_position.get(position.id, []),
+            key=lambda item: (-len(item["matched_keywords"]), item["bullet_id"]),
+        )
+        selected.extend(items[:quota])
+    return selected
+
+
 def select_keywords_to_extend(missing_keywords: list[str], k_value: int) -> list[str]:
     """K=0 完全不做延伸；K=1..10 按比例从缺失关键词里选出一部分去尝试构造
     延伸建议，K 越大数量越多，K=10 覆盖全部。纯函数，方便单测锁定这条
@@ -320,6 +462,15 @@ REWRITE_HITS_SYSTEM_PROMPT = """\
 核心职责描述。请只调整"行为"和"结果"的措辞和表达方式，让它们更贴合 JD 的
 用词习惯，不改变任何事实内容——不能新增、删除或替换任何关键词，不能改变
 结果的数值或量级，只是换一种更贴合 JD 语境的说法。
+
+品控要求（硬性）：
+- 如果原文本里出现具体数字/百分比/量级（比如"70% 提升到 85%""3B+ 条记录"
+  "5 分钟以内"），润色后必须原样保留这些具体数字，不能为了追求简洁而省略、
+  模糊化或替换成"significantly improved"这类定性表述。
+- 语言风格要稳重、专业，使用正式的英文简历用语；不要在正文里插入括号解释
+  （比如"(this means...)"这种补充说明），也绝不能出现方括号引用/引文标记
+  （比如"[cite: 1]""[1]"这类痕迹）——这些不是简历应该有的内容。
+- 只输出最终的简历行文本本身，不要有多余的前后缀说明。
 
 严格按下面的 JSON 结构输出，数组长度和顺序必须和输入的贡献列表一一对应：
 {
@@ -344,11 +495,17 @@ def rewrite_hit_bullets(hits: list[dict], jd: JDRecord, llm_client: LLMClient) -
     out = []
     for i, hit in enumerate(hits):
         item = rewritten[i] if i < len(rewritten) and isinstance(rewritten[i], dict) else {}
+        # 品控兜底：不管 Prompt 有没有被严格遵守，生成文本里但凡带有中括号
+        # 引用标记（比如 [cite: 1]），一律用规则清理掉，见 _strip_citation_artifacts
+        # 的说明。清理后如果整段变空，回退到原始真实内容，不能因为清理导致
+        # 这条贡献句变成空字符串。
+        action_summary = _strip_citation_artifacts(item.get("action_summary")) or hit["action_summary"]
+        result_summary = _strip_citation_artifacts(item.get("result_summary")) or hit["result_summary"]
         out.append(
             {
                 **hit,
-                "action_summary": item.get("action_summary") or hit["action_summary"],
-                "result_summary": item.get("result_summary") or hit["result_summary"],
+                "action_summary": action_summary,
+                "result_summary": result_summary,
             }
         )
     return out
@@ -373,6 +530,10 @@ EXTENSION_SUGGESTION_SYSTEM_PROMPT = """\
 
 如果对某个关键词找不到任何合理相关的经历，就把 plausible 填 false，不要为
 明显无关的技能强行编造关联，也不需要再填其他字段。
+
+品控要求（硬性）：语言风格要稳重、专业，使用正式的英文简历用语；不要在
+action_summary/result_summary/rationale 里插入括号解释，也绝不能出现方括号
+引用/引文标记（比如"[cite: 1]""[1]"这类痕迹）。
 
 严格按下面的 JSON 结构输出，suggestions 数组要覆盖输入的每一个关键词：
 {
@@ -442,9 +603,11 @@ def generate_extension_suggestions(
                 "experience_entry_id": position.id,
                 "position_title": position.position_title,
                 "project_name": position.project_name,
-                "action_summary": item.get("action_summary") or "",
-                "result_summary": item.get("result_summary"),
-                "rationale": item.get("rationale") or "",
+                # 品控兜底：同 rewrite_hit_bullets，规则层清理中括号引用标记，
+                # 不完全依赖 Prompt 是否被严格遵守。
+                "action_summary": _strip_citation_artifacts(item.get("action_summary")) or "",
+                "result_summary": _strip_citation_artifacts(item.get("result_summary")),
+                "rationale": _strip_citation_artifacts(item.get("rationale")) or "",
             }
         )
     return suggestions
@@ -488,7 +651,9 @@ def build_resume_draft(
     known_companies = _known_companies(positions)
 
     jd_keywords = collect_jd_keywords(jd_parsed)
-    hits = find_hit_bullets(jd_keywords, positions)
+    # 品控：这里改用 select_bullets_by_quota（按配额固定出现+固定数量），
+    # 不再是"命中才出现"的 find_hit_bullets——见该函数文档字符串的说明。
+    hits = select_bullets_by_quota(jd_keywords, positions)
     hit_items = rewrite_hit_bullets(hits, jd, heavy_client) if hits else []
     if hit_items:
         hit_items = _validate_and_repair_hit_items(
@@ -559,10 +724,66 @@ def _build_skills_lines(db: Session, profile) -> list[str]:
     return lines
 
 
-def _build_static_sections(db: Session) -> tuple[list[dict], list[dict]]:
+# 品控：独立项目挑选（打磨阶段用户反馈第 3 点，参考 prompt 原话"项目经历
+# 选择最高价值的两个"）。独立项目仍然不参与打分（scoring.build_profile_context
+# 完全不受影响）、也不受 K 值控制——这两条 profile_service.py/PersonalProject
+# 文档字符串里记的边界没有变；这里新增的只是"生成简历这一步该展示哪些项目"
+# 这个纯展示层面的筛选，不修改 personal_project 表本身的任何数据。
+#
+# PersonalProjectBullet 不像 ExperienceBullet 那样有预先抽取好的 keywords
+# 衍生字段（见该表文档字符串：独立项目不参与关键词匹配，没建这个字段），
+# 这里退化成最朴素的规则：JD 关键词有多少个能在项目名+全部 bullet 文本里
+# 找到（大小写不敏感的子串匹配），数量就是它的相关度分数——不需要额外的
+# LLM 调用，纯本地计算，确定性、可单测。
+PROJECT_TOP_N = 2
+PROJECT_BULLET_QUOTA = 2
+
+
+def _keyword_overlap_score(text: str | None, jd_keywords_normalized: list[str]) -> int:
+    haystack = (text or "").lower()
+    return sum(1 for kw in jd_keywords_normalized if kw and kw in haystack)
+
+
+def _select_top_projects(projects: list, jd_keywords_normalized: list[str], top_n: int = PROJECT_TOP_N) -> list:
+    """项目数量不超过 top_n 时直接全部保留（不触发筛选，向后兼容只有 1-2
+    个项目的场景）；超过时按相关度分数取前 top_n 个，展示顺序仍然沿用
+    `projects` 参数的原始顺序，不按分数重排——避免把"选哪几个"和"按什么
+    顺序摆"这两件事混在一起。"""
+    if len(projects) <= top_n:
+        return list(projects)
+
+    def _project_text(p) -> str:
+        return " ".join([p.project_name or "", *(b.content or "" for b in p.bullets)])
+
+    ranked = sorted(
+        enumerate(projects),
+        key=lambda pair: (-_keyword_overlap_score(_project_text(pair[1]), jd_keywords_normalized), pair[0]),
+    )
+    top_ids = {p.id for _, p in ranked[:top_n]}
+    return [p for p in projects if p.id in top_ids]
+
+
+def _select_top_bullets(bullets: list, jd_keywords_normalized: list[str], top_n: int) -> list:
+    if len(bullets) <= top_n:
+        return list(bullets)
+    ranked = sorted(
+        enumerate(bullets),
+        key=lambda pair: (-_keyword_overlap_score(pair[1].content, jd_keywords_normalized), pair[0]),
+    )
+    top_ids = {b.id for _, b in ranked[:top_n]}
+    return [b for b in bullets if b.id in top_ids]
+
+
+def _build_static_sections(db: Session, jd_keywords: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """独立项目 / 教育经历这两块"静态背景信息"——见 profile_service.py 里
-    PersonalProject/EducationEntry 的说明，不参与 JD 关键词匹配/K 值裁剪，
-    每次生成简历都原样带上全部内容。"""
+    PersonalProject/EducationEntry 的说明，不参与打分、不受 K 值控制。教育
+    经历继续原样带上全部内容；独立项目这一版新增"按 JD 相关度选价值最高的
+    `PROJECT_TOP_N` 个、每个最多展示 `PROJECT_BULLET_QUOTA` 条 bullet"这条
+    展示层筛选（见上面 _select_top_projects 的说明），`jd_keywords` 留空
+    （比如还没跑过 /analyze）时相关度分数全部为 0，退化成"按原始顺序取前
+    N 个"，不会报错也不会漏项目。"""
+    jd_keywords_normalized = [_norm_keyword(kw) for kw in (jd_keywords or [])]
+    selected_projects = _select_top_projects(get_personal_projects(db), jd_keywords_normalized)
     projects = [
         {
             "project_name": p.project_name,
@@ -570,9 +791,16 @@ def _build_static_sections(db: Session) -> tuple[list[dict], list[dict]]:
             "end_date": p.end_date,
             "is_current": p.is_current,
             "date_range": format_date_range(p.start_date, p.end_date, p.is_current),
-            "bullets": [b.content for b in sorted(p.bullets, key=lambda b: (b.order_index, b.id))],
+            "bullets": [
+                b.content
+                for b in _select_top_bullets(
+                    sorted(p.bullets, key=lambda b: (b.order_index, b.id)),
+                    jd_keywords_normalized,
+                    PROJECT_BULLET_QUOTA,
+                )
+            ],
         }
-        for p in get_personal_projects(db)
+        for p in selected_projects
     ]
     education = [
         {
@@ -766,7 +994,8 @@ def confirm_and_finalize(
             }
         )
 
-    projects, education = _build_static_sections(db)
+    jd_keywords = collect_jd_keywords(jd.parsed_meta or {})
+    projects, education = _build_static_sections(db, jd_keywords)
     resume_json = {
         "basic": {
             "full_name": profile.full_name,

@@ -200,11 +200,15 @@ class PersonalProject(Base):
     没有"公司"这个上一级，也不需要 A/B/C 三层里 A 层那套精确匹配逻辑,复用
     反而会让 experience_entry 的 level 语义变得混乱。
 
-    这一版明确不参与 JD 打分（scoring.build_profile_context）和简历重制的
-    关键词命中/延伸建议逻辑（resume_tailor.find_hit_bullets）——和
-    profile_basic.resume_summary/skills_text 一样，当成"静态背景信息",每次
-    生成简历都原样带上，不做 K 值裁剪。这是这一版刻意收窄的范围（见
-    docs/DEVELOPMENT_LOG.md 对应章节),不是遗漏。"""
+    这一版明确不参与 JD 打分（scoring.build_profile_context）、也不受 K 值
+    控制（resume_tailor.select_keywords_to_extend 完全不碰这张表）——和
+    profile_basic.resume_summary/skills_text 一样，当成"静态背景信息"。这
+    条边界没有变；但简历重制阶段的"品控"（打磨阶段用户反馈第 3 点）新增了
+    一层纯展示层面的筛选：生成简历时只挑对当前 JD 相关度最高的 2 个项目、
+    每个最多展示 2 条 bullet（resume_tailor._select_top_projects），不是
+    "每次都原样带上全部内容"了——这个筛选只影响某一次生成出来的简历长什么
+    样，不修改这张表本身的任何数据，画像页的项目管理功能仍然能看到和编辑
+    全部项目。详见 docs/DEVELOPMENT_LOG.md 对应章节。"""
 
     __tablename__ = "personal_project"
 

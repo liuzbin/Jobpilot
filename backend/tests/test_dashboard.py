@@ -542,9 +542,13 @@ def test_tailor_draft_and_confirm_full_flow():
         jd_url = create.headers["location"].split("?")[0]
 
         # JD 要的两个关键词在这份画像里都没有真实证据（画像是 Payments 相关的
-        # 经历），所以不会有任何"命中"，重点验证的是"延伸建议"这条链路：
-        # Spark 被判定合理、RAG 被判定不合理并被过滤掉。K=10 保证两个缺失
-        # 关键词都进入待延伸列表（不会被 K 值的比例选择提前刷掉）。
+        # 经历），所以真正的"关键词命中"是零；但品控改动之后，画像仅有的这
+        # 段工作经历（2 条真实 bullet）仍然会被 select_bullets_by_quota 按
+        # 配额固定选中（不再是"命中才出现"），照样会先走一遍命中项重写+护栏
+        # 校验（见下面 extend_fake/jd_parse_fake 各自新增的第一个响应），
+        # 之后重点验证的还是"延伸建议"这条链路：Spark 被判定合理、RAG 被
+        # 判定不合理并被过滤掉。K=10 保证两个缺失关键词都进入待延伸列表
+        # （不会被 K 值的比例选择提前刷掉）。
         jd_parse_fake = FakeLLMClient(
             responses=[
                 {
@@ -555,6 +559,11 @@ def test_tailor_draft_and_confirm_full_flow():
                     "core_responsibilities": [],
                     "key_skills": ["Spark", "RAG"],
                 },
+                # 品控新增：配额兜底选中的 2 条真实 bullet（零命中）的批量校验，
+                # 空 results 数组按"没有问题"处理（见 _batch_validate_facts 的
+                # 默认值兜底），配合下面 extend_fake 返回空 rewritten 一起，
+                # 保证这条命中项路径不产生任何副作用，测试只需要关注延伸建议。
+                {"results": []},
                 # 事实护栏校验：延伸建议批量校验的那一次调用（RAG 已经被判定
                 # 不合理提前过滤掉了，这里只需要覆盖剩下的 Spark 一条）。
                 {"results": [{"consistent": True}]},
@@ -562,6 +571,10 @@ def test_tailor_draft_and_confirm_full_flow():
         )
         extend_fake = FakeLLMClient(
             responses=[
+                # 品控新增：配额兜底选中的 2 条真实 bullet 的重写——空 rewritten
+                # 数组会让 rewrite_hit_bullets 对每一条都回退到真实原文（见该
+                # 函数的兜底逻辑），不影响下面延伸建议这条链路要验证的行为。
+                {"rewritten": []},
                 {
                     "suggestions": [
                         {
@@ -684,10 +697,15 @@ def test_tailor_draft_page_includes_style_selector():
         )
         jd_url = create.headers["location"].split("?")[0]
 
-        # k=0：不做技能延伸，只需要一次 JD 解析调用，不需要另外准备重量模型
-        # 的延伸建议响应——这个测试只关心"风格下拉框有没有渲染出来"，
-        # 没必要把 build_resume_draft 完整的建议链路也搭一遍。
-        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
+        # k=0：不做技能延伸，不需要另外准备重量模型的延伸建议响应——这个测试
+        # 只关心"风格下拉框有没有渲染出来"，没必要把 build_resume_draft 完整
+        # 的建议链路也搭一遍。但品控改动后，画像里仅有的那段工作经历仍然会
+        # 被 select_bullets_by_quota 按配额固定选中（不再是"命中才出现"），
+        # 会先走一遍命中项重写+护栏校验——light/heavy 这里复用同一个 Fake
+        # 实例，所以按"结构化解析 → 命中项重写 → 命中项批量校验"这个真实的
+        # 调用顺序依次预置三个响应（空 rewritten/results 都会被安全地当成
+        # "回退到真实原文/没有问题"处理，不影响这个测试要验证的内容）。
+        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE), {"rewritten": []}, {"results": []}])
         app.dependency_overrides[get_light_client] = lambda: jd_parse_fake
         app.dependency_overrides[get_heavy_client] = lambda: jd_parse_fake
         try:
@@ -1441,12 +1459,22 @@ def test_resume_template_create_rejects_broken_jinja_syntax():
 
 
 def test_resume_template_delete_last_one_shows_friendly_error():
+    """品控改动后，模板库空库场景下访问模板页会自动种下两条内置模板（默认
+    模板 + "标准模板（含项目名 + LinkedIn）"，见 ensure_seed_additional_template），
+    所以要先把库里的模板依次删到只剩最后一条，才能验证"最后一个不能删"
+    这条规则本身。"""
     with _client() as client:
         page = client.get("/dashboard/resume-templates")
-        match = re.search(r"/dashboard/resume-templates/(\d+)/delete", page.text)
-        assert match, "至少应该有一个种子默认模板"
-        template_id = int(match.group(1))
-        r = client.post(f"/dashboard/resume-templates/{template_id}/delete", follow_redirects=True)
+        template_ids = [int(m) for m in re.findall(r"/dashboard/resume-templates/(\d+)/delete", page.text)]
+        assert len(template_ids) >= 1, "至少应该有一个种子默认模板"
+
+        for template_id in template_ids[:-1]:
+            r = client.post(f"/dashboard/resume-templates/{template_id}/delete", follow_redirects=True)
+            assert r.status_code == 200
+            assert "已删除模板" in r.text
+
+        last_template_id = template_ids[-1]
+        r = client.post(f"/dashboard/resume-templates/{last_template_id}/delete", follow_redirects=True)
         assert r.status_code == 200
         assert "至少要保留一个" in r.text
 
@@ -1472,10 +1500,10 @@ def test_tailor_draft_page_lists_md_templates_in_optgroup():
         )
         jd_url = create.headers["location"].split("?")[0]
 
-        # 跟 test_tailor_draft_page_includes_style_selector 一样：k=0 只需要
-        # 一次 JD 解析调用，直接给 /tailor 这次请求配好两个槽位的 Fake 即可，
-        # 不需要先跑一遍 /analyze。
-        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
+        # 跟 test_tailor_draft_page_includes_style_selector 一样：k=0 不需要
+        # 延伸建议响应，但品控改动后画像里仅有的那段工作经历仍然会被按配额
+        # 固定选中，要先走一遍命中项重写+护栏校验，见该测试的详细说明。
+        jd_parse_fake = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE), {"rewritten": []}, {"results": []}])
         app.dependency_overrides[get_light_client] = lambda: jd_parse_fake
         app.dependency_overrides[get_heavy_client] = lambda: jd_parse_fake
         try:
@@ -1491,6 +1519,7 @@ def test_tailor_draft_page_lists_md_templates_in_optgroup():
 
 def test_tailor_confirm_with_md_template_renders_via_template_path():
     with _client() as client:
+        client.get("/dashboard/resume-templates")  # 确保种子模板已经存在，避免新建的这个意外顶替成默认/抢占排序
         _seed_position_via_upload(client)
 
         create_template = client.post(

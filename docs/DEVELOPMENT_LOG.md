@@ -737,3 +737,30 @@ Phase 4 补充版本的 `_run_silent_install` 用 `subprocess.run([installer_pat
 **验证结果**：全量 359 个 pytest 用例（数量不变，本次没有新增/删除测试用例，只是调整了已有用例的 mock 方式）在云端沙盒和用户设备侧独立 Windows 环境两边分批跑通；插件测试 `npm test`（33 个用例，含新增的 3 个）和 `npm run check-permissions` 均通过。
 
 **遗留**：用户第三点反馈（参考上传的简历生成提示词做生成品控 + 复用其中的 MD 简历模板）按用户明确的优先级排在下一阶段；LinkedIn 插件侧 UI（侧边栏抓取入口）排在这之后。
+
+---
+
+## 打磨阶段用户反馈修复：简历生成品控 + 复用用户提供的 MD 简历模板（2026-09-15）
+
+**背景**：用户上传了自己平时手动用 ChatBot 生成简历时用的提示词文件（含具体规则和一份 TD Securities 投递用的示例简历），要求参考这份提示词做好生成简历的"品控"，并直接复用其中的 MD 格式简历模板。按用户明确的优先级，这是继"JD 分析提速 + LinkedIn 抓取保留排版"之后的第二项，LinkedIn 插件侧 UI 排在最后。
+
+用户提示词里的规则拆解成两类：
+
+1. **格式配额（和 K 值正交）**：工作经历固定 3 段都要出现、按相关度给 3/3/2 的 bullet 配额；独立项目选价值最高的 2 个，每个 2 条 bullet。用户明确说明这条和 K 值是两码事——K 值管"要不要为缺失关键词构造延伸建议"，配额管"每段经历该出现几条 bullet 这个格式契约"，两者独立生效。
+2. **语气/格式护栏**：稳重专业的英文、不允许括号解释、不允许方括号引用标记（如 `[cite: 1]`）、有具体指标必须保留、章节不能缺（含顶部联系方式栏）、输出必须是可直接复制的原始 Markdown 文本。逐条核对后确认：章节完整性和"可复制的原始文本"这两条已经被现有架构结构性保证（`resume_json` 各板块由 Python 代码确定性组装，不是整篇简历丢给 LLM 自由生成；`resume_result.html` 用 `<pre>` 标签原样展示 `markdown_text`，不会被渲染成 HTML），不需要额外代码；语气和引用标记这两条需要新增护栏。
+
+**实现**：
+
+- `app/services/resume_tailor.py`：
+  - 新增 `select_bullets_by_quota`（配合 `_score_all_bullets`/`_bullet_quota_for_rank`）：不再是 `find_hit_bullets` 那种"命中才出现"的二元判断，而是给每一条 bullet（含零命中的）打相关度分数，按分数给每段工作经历排名后分配 3/3/2 配额；配额只是上限，真实内容不够时如实展示、绝不编造。展示顺序仍沿用调用方传入的 `positions` 原始顺序，只有配额大小随排名变化，避免"越相关排越靠前"和"简历该按时间顺序读"这两条约定打架。`build_resume_draft` 里 `find_hit_bullets` 的调用点换成这个新函数；`find_hit_bullets` 本身保留不变，继续给需要"只看真正命中"的调用方使用。
+  - 新增 `_select_top_projects`/`_select_top_bullets`：独立项目按 JD 关键词在项目名+bullet 文本里的子串命中数排序，选前 `PROJECT_TOP_N`（2）个、每个最多 `PROJECT_BULLET_QUOTA`（2）条 bullet；纯本地计算，不额外消耗 LLM 调用（`PersonalProjectBullet` 不像 `ExperienceBullet` 那样有预抽取的 `keywords` 字段，这里退化成最朴素的子串匹配）。`_build_static_sections` 签名新增 `jd_keywords` 参数，`confirm_and_finalize` 调用处补上 `collect_jd_keywords(jd.parsed_meta or {})`。
+  - `REWRITE_HITS_SYSTEM_PROMPT`/`EXTENSION_SUGGESTION_SYSTEM_PROMPT` 新增品控要求段落（稳重专业、不允许括号解释、不允许方括号引用标记、必须保留具体指标）；新增 `_strip_citation_artifacts` 正则规则，在两处 LLM 输出被消费的地方（`rewrite_hit_bullets`/`generate_extension_suggestions`）做规则层兜底清理，不完全依赖 Prompt 被严格遵守；清理后如果整段变空会回退到原始真实内容，不会把贡献句清空。
+  - `PersonalProject` 表的文档字符串同步更新："不参与打分、不受 K 值控制"这条边界没变，新增一句说明简历生成这一步会做展示层筛选。
+- `app/services/resume_template_service.py`：新增 `ensure_seed_additional_template`，把用户上传示例简历对应的 Jinja2 模板（和内置默认模板相比，工作经历标题行多带项目名"公司 | 职位 | 项目"三段式、联系方式行多一个 LinkedIn 链接）作为一条新模板幂等地插入模板库（按名称查重，不重复插入），不设为默认、不覆盖用户可能已经调整过的默认模板；在"简历模板"页面、生成简历草稿页面、简历结果页这三处会用到模板下拉框的路由里都调用一次，保证用户在这几个地方都能选到。
+- `app/api/routes_dashboard.py`：三处 `list_resume_templates(db)` 调用前补上 `ensure_seed_additional_template(db)`。
+
+**测试改动说明**：`build_resume_draft` 现在对"零命中但有真实内容"的场景也会走一遍 `rewrite_hit_bullets`+护栏校验（以前这种场景直接跳过，`hits` 是空列表），涉及的既有测试（`test_dashboard.py`/`test_resume_tailor.py`）按真实调用顺序补齐了新增的 Fake 响应（用空 `rewritten`/`results` 数组做安全兜底，语义上等价于"回退到真实原文/没有问题"，不影响各测试本来要验证的行为）；模板库相关测试因为空库场景现在会自动种下两条内置模板（不再是一条），依赖"库里只有一条模板"这个假设的测试做了相应调整。新增 13 个测试用例覆盖配额分配、项目/bullet 筛选、引用标记清理规则、`ensure_seed_additional_template` 幂等性、新模板的渲染正确性。
+
+**验证结果**：全量 372 个 pytest 用例（359 + 13 新增）在云端沙盒和用户设备侧独立 Windows 环境两边分批跑通；这次改动没有涉及任何插件端文件，`npm test`/`check-permissions` 无需重跑。
+
+**遗留**：LinkedIn 插件侧 UI（侧边栏"添加 LinkedIn profile 到 JobPilot"）排在下一阶段，按用户明确的优先级顺序，本次不动。

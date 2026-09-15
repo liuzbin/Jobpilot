@@ -7,10 +7,13 @@ import pytest
 from app.models.tables import ResumeTemplate
 from app.services.resume_template_service import (
     DEFAULT_TEMPLATE_MARKDOWN,
+    SEED_ADDITIONAL_TEMPLATE_MARKDOWN,
+    SEED_ADDITIONAL_TEMPLATE_NAME,
     ResumeTemplateNotFoundError,
     ResumeTemplateRenderError,
     create_template,
     delete_template,
+    ensure_seed_additional_template,
     get_or_create_default_template,
     get_template,
     list_templates,
@@ -128,6 +131,82 @@ def test_render_template_markdown_missing_optional_field_renders_blank():
 def test_render_template_markdown_syntax_error_raises_friendly_error():
     with pytest.raises(ResumeTemplateRenderError):
         render_template_markdown("{% for x in %}", MINIMAL_CONTEXT)
+
+
+# ---------- 打磨阶段用户反馈第 3 点：新增的品控模板（含项目名 + LinkedIn） ----------
+
+
+def test_ensure_seed_additional_template_inserts_once_and_is_idempotent(db_session):
+    """幂等：多次调用只插入一条，不会因为反复访问相关页面而在模板库里
+    堆出一堆同名模板；新插入的这条不应该抢占用户已经选好的默认模板。"""
+    get_or_create_default_template(db_session)  # 先有一条默认模板，模拟真实场景
+    default_before = db_session.query(ResumeTemplate).filter(ResumeTemplate.is_default.is_(True)).one()
+
+    ensure_seed_additional_template(db_session)
+    assert db_session.query(ResumeTemplate).filter(ResumeTemplate.name == SEED_ADDITIONAL_TEMPLATE_NAME).count() == 1
+
+    ensure_seed_additional_template(db_session)  # 再调一次
+    assert db_session.query(ResumeTemplate).filter(ResumeTemplate.name == SEED_ADDITIONAL_TEMPLATE_NAME).count() == 1
+
+    seeded = get_template(db_session, get_or_create_default_template(db_session).id)  # 触发一次查询确保 session 状态正常
+    assert seeded is not None
+    default_after = db_session.query(ResumeTemplate).filter(ResumeTemplate.is_default.is_(True)).one()
+    assert default_after.id == default_before.id  # 默认模板没有被新插入的这条抢占
+
+
+def test_seed_additional_template_renders_project_name_and_linkedin():
+    """和内置默认模板相比，这份新模板多带了两处：工作经历标题行里的项目名
+    （"公司 | 职位 | 项目"三段式），联系方式那一行里的 LinkedIn 链接。"""
+    context = {
+        "basic": {
+            "full_name": "Jane Doe",
+            "current_location": "Toronto, ON",
+            "phone": "+1 000",
+            "email": "jane@example.com",
+            "github_url": "https://github.com/jane",
+            "linkedin_url": "https://www.linkedin.com/in/jane",
+        },
+        "summary": ["Summary line"],
+        "skills": ["Skill line"],
+        "experience": [
+            {
+                "company_name": "Acme",
+                "position_title": "Engineer",
+                "project_name": "Some Platform",
+                "date_range": "2020 – 至今",
+                "bullet_items": [{"action_summary": "Did stuff", "result_summary": "50% faster"}],
+            }
+        ],
+        "projects": [{"project_name": "Side Project", "date_range": "2022", "bullets": ["Built a thing"]}],
+        "education": [{"school": "State U", "degree": "BSc", "location": "City", "date_range": "2016 – 2020"}],
+    }
+    output = render_template_markdown(SEED_ADDITIONAL_TEMPLATE_MARKDOWN, context)
+    assert "https://www.linkedin.com/in/jane" in output
+    assert "**Acme** | *Engineer* | Some Platform" in output
+
+
+def test_seed_additional_template_omits_project_name_segment_when_blank():
+    """没有 project_name 的工作经历（比如非技术岗、或者用户没填）不应该
+    渲染出多余的" | "分隔符。"""
+    context = {
+        "basic": {"full_name": "Jane Doe"},
+        "summary": [],
+        "skills": [],
+        "experience": [
+            {
+                "company_name": "Acme",
+                "position_title": "Engineer",
+                "project_name": None,
+                "date_range": "2020 – 至今",
+                "bullet_items": [],
+            }
+        ],
+        "projects": [],
+        "education": [],
+    }
+    output = render_template_markdown(SEED_ADDITIONAL_TEMPLATE_MARKDOWN, context)
+    assert "**Acme** | *Engineer*\n" in output
+    assert "**Acme** | *Engineer* |" not in output
 
 
 def test_default_template_markdown_renders_all_sections():

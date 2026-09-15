@@ -92,6 +92,7 @@ from app.services.resume_template_service import (
     ResumeTemplateRenderError,
     create_template as create_resume_template,
     delete_template as delete_resume_template,
+    ensure_seed_additional_template,
     get_or_create_default_template,
     list_templates as list_resume_templates,
     set_default_template,
@@ -567,6 +568,7 @@ def profile_delete_skill(skill_id: int, db: Session = Depends(get_db)) -> Redire
 @router.get("/resume-templates", response_class=HTMLResponse)
 def resume_templates_page(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     get_or_create_default_template(db)  # 确保空库场景下也有至少一个能选的模板
+    ensure_seed_additional_template(db)  # 打磨阶段用户反馈第 3 点：补一条内置的品控模板，幂等
     return templates.TemplateResponse(
         "resume_templates.html",
         {
@@ -952,6 +954,8 @@ def job_tailor_draft(
         missing = "轻量" if light_client is None else "重量"
         return _redirect_with_flash(detail_url, f"{missing}模型还没配置，请先到模型配置页面填写", error=True)
 
+    ensure_seed_additional_template(db)  # 保证生成简历这一页的模板下拉框里也能选到品控模板
+
     k_value = max(0, min(10, k))
     try:
         draft = build_resume_draft(db, jd_id, k_value, light_client, heavy_client)
@@ -1034,6 +1038,7 @@ def resume_version_detail(
     resume_version = db.get(ResumeVersion, resume_id)
     if jd is None or resume_version is None or resume_version.jd_id != jd_id:
         raise HTTPException(status_code=404, detail="resume version not found")
+    ensure_seed_additional_template(db)  # 保证换模板重新生成 PDF 时也能选到品控模板
     return templates.TemplateResponse(
         "resume_result.html",
         {

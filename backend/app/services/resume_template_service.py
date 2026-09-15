@@ -216,6 +216,82 @@ def get_or_create_default_template(db: Session) -> ResumeTemplate:
     return template
 
 
+# 打磨阶段用户反馈第 3 点："直接复用"用户提供的示例简历（他当前实际在用、
+# 投递 TD Securities 用的那一份）的 MD 格式。这份示例本身不是 Jinja2 模板
+# （姓名/公司/项目都是真实值），格式和内置的 DEFAULT_TEMPLATE_MARKDOWN 高度
+# 相似——推测两者本来就是同一个人前后两次上传的简历演化出来的——但有两处
+# 更精确的差异：工作经历标题行多带了一段 project_name（"公司 | 职位 | 项目"
+# 三段式，而不是只有"公司 | 职位"两段），联系方式那一行多了 LinkedIn 链接。
+#
+# 新增一条独立的模板记录，而不是直接改写 DEFAULT_TEMPLATE_MARKDOWN 这个已有
+# 默认模板的内容——用户可能已经在模板库页面里把默认模板调整成自己想要的样子，
+# 贸然覆盖会丢掉那些调整；新增之后由用户自己在"简历模板"页面选用/设为默认，
+# 和这一版"两套渲染机制刻意并存、用户可选"的原则一致。
+SEED_ADDITIONAL_TEMPLATE_NAME = "标准模板（含项目名 + LinkedIn）"
+SEED_ADDITIONAL_TEMPLATE_MARKDOWN = """\
+<div align="center">
+  <h1>{{ basic.full_name }}</h1>
+  <p>{{ basic.current_location }} | {{ basic.phone }} | <a href="mailto:{{ basic.email }}">{{ basic.email }}</a> | <a href="{{ basic.github_url }}">{{ basic.github_url }}</a> | <a href="{{ basic.linkedin_url }}">{{ basic.linkedin_url }}</a></p>
+</div>
+
+## PROFESSIONAL SUMMARY
+
+{% for line in summary %}
+- {{ line }}
+{% endfor %}
+
+## TECHNICAL SKILLS
+
+{% for line in skills %}
+- {{ line }}
+{% endfor %}
+
+## PROFESSIONAL EXPERIENCE
+
+{% for exp in experience %}
+**{{ exp.company_name }}** | *{{ exp.position_title }}*{{ (" | " + exp.project_name) if exp.project_name else "" }}
+<div align="right"><i>{{ exp.date_range }}</i></div>
+
+{% for item in exp.bullet_items %}
+- {{ item.action_summary }}{% if item.result_summary %}, {{ item.result_summary }}{% endif %}
+{% endfor %}
+
+{% endfor %}
+
+## PROJECT EXPERIENCE
+
+{% for proj in projects %}
+**{{ proj.project_name }}**
+<div align="right"><i>{{ proj.date_range }}</i></div>
+
+{% for bullet in proj.bullets %}
+- {{ bullet }}
+{% endfor %}
+
+{% endfor %}
+
+## EDUCATION
+
+{% for edu in education %}
+**{{ edu.school }}**{% if edu.location %} | {{ edu.location }}{% endif %}
+*{{ edu.degree }}*
+<div align="right"><i>{{ edu.date_range }}</i></div>
+
+{% endfor %}
+"""
+
+
+def ensure_seed_additional_template(db: Session) -> None:
+    """幂等：按名称查不到这条模板才插入（用户就算把自己那份改了别的名字，
+    最坏情况只是库里多一条同样内容的模板，不会出错，也不会重复插入无限
+    增长——按名称查重这一步本身就防住了"每次访问模板库页面都插一条"）。
+    不设为默认，不影响用户当前已经选好的默认模板。"""
+    existing = db.query(ResumeTemplate).filter(ResumeTemplate.name == SEED_ADDITIONAL_TEMPLATE_NAME).one_or_none()
+    if existing is not None:
+        return
+    create_template(db, SEED_ADDITIONAL_TEMPLATE_NAME, SEED_ADDITIONAL_TEMPLATE_MARKDOWN, set_default=False)
+
+
 def create_template(db: Session, name: str, content: str, set_default: bool = False) -> ResumeTemplate:
     name = (name or "").strip()
     content = content or ""
