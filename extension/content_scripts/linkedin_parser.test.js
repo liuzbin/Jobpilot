@@ -15,7 +15,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-const { extractLinkedInJob } = require("./linkedin_parser.js");
+const { extractLinkedInJob, _blockTextOf } = require("./linkedin_parser.js");
 
 let failures = 0;
 let passed = 0;
@@ -95,6 +95,60 @@ test("只用空白字符构成的字段（元素存在但没有实际文本）�
   const result = extractLinkedInJob(doc, null);
   assert.equal(result.title, null);
   assert.equal(result.source_url, null);
+});
+
+// 打磨阶段用户反馈修复：JD 正文如果有段落/bullet 结构，应该按块级标签换行
+// 保留下来，而不是像标题/公司名那样把所有空白（含换行）压成一个空格，
+// 否则一段有格式的 JD 在 Dashboard 页面里会挤成一整坨看不出结构的文字。
+test("JD 正文有多段落 + bullet 列表结构时，description_raw 按块级标签保留换行，行内标签不拆碎句子", () => {
+  const doc = new JSDOM(
+    `<!doctype html><html><body>
+       <div class="job-details-jobs-unified-top-card__job-title"><h1>Backend Engineer</h1></div>
+       <div id="job-details">
+         <p>We are looking for a <strong>Backend Engineer</strong> with 3+ years of experience.</p>
+         <p>Responsibilities:</p>
+         <ul>
+           <li>Build and maintain <a href="#">payment services</a>.</li>
+           <li>Own on-call rotation.</li>
+         </ul>
+       </div>
+     </body></html>`
+  ).window.document;
+  const result = extractLinkedInJob(doc, "https://www.linkedin.com/jobs/view/333/");
+
+  const lines = result.description_raw.split("\n");
+  assert.equal(lines.length, 4);
+  assert.equal(lines[0], "We are looking for a Backend Engineer with 3+ years of experience.");
+  assert.equal(lines[1], "Responsibilities:");
+  assert.equal(lines[2], "Build and maintain payment services.");
+  assert.equal(lines[3], "Own on-call rotation.");
+});
+
+test("JD 正文只有单个容器包纯文本（没有 <p>/<li> 这类块级子标签）时，行为和以前完全一样：合并成单行", () => {
+  const doc = new JSDOM(
+    `<!doctype html><html><body>
+       <div id="job-details">
+         We are looking for a Backend Engineer with 3+ years of experience.
+         You will build and maintain payment services used by millions of users.
+       </div>
+     </body></html>`
+  ).window.document;
+  const result = extractLinkedInJob(doc, null);
+  assert.equal(
+    result.description_raw,
+    "We are looking for a Backend Engineer with 3+ years of experience. You will build and maintain payment services used by millions of users."
+  );
+});
+
+test("_blockTextOf：<br> 换行、连续空白行、以及只有空白的元素都被正确处理", () => {
+  const doc = new JSDOM(
+    `<!doctype html><html><body>
+       <div id="x">Line one<br><br>Line two<div>   </div>Line three</div>
+     </body></html>`
+  ).window.document;
+  const el = doc.querySelector("#x");
+  assert.equal(_blockTextOf(el), "Line one\nLine two\nLine three");
+  assert.equal(_blockTextOf(null), null);
 });
 
 console.log(`\n${passed} passed, ${failures} failed`);

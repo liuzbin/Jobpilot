@@ -327,11 +327,12 @@ def test_analyze_without_configured_models_shows_friendly_error():
 
 
 def test_analyze_end_to_end_with_fake_llm_produces_deterministic_score():
-    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
-    fake_heavy = FakeLLMClient(responses=[dict(FAKE_SCORING_RESPONSE)])
+    # JD 分析（结构化解析 + 打分）两步现在都走轻量模型槽位（打磨阶段用户
+    # 反馈修复：打分那步原来走重量模型，两次调用顺序执行导致明显延迟），
+    # 所以这里给同一个 FakeLLMClient 按调用顺序预置两条响应。
+    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE), dict(FAKE_SCORING_RESPONSE)])
 
     app.dependency_overrides[get_light_client] = lambda: fake_light
-    app.dependency_overrides[get_heavy_client] = lambda: fake_heavy
     try:
         with _client() as client:
             client.post(
@@ -357,21 +358,17 @@ def test_analyze_end_to_end_with_fake_llm_produces_deterministic_score():
             assert "77" in r.text
     finally:
         app.dependency_overrides.pop(get_light_client, None)
-        app.dependency_overrides.pop(get_heavy_client, None)
 
 
 def test_analyze_missing_jd_returns_404():
-    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
-    fake_heavy = FakeLLMClient(responses=[dict(FAKE_SCORING_RESPONSE)])
+    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE), dict(FAKE_SCORING_RESPONSE)])
     app.dependency_overrides[get_light_client] = lambda: fake_light
-    app.dependency_overrides[get_heavy_client] = lambda: fake_heavy
     try:
         with _client() as client:
             r = client.post("/dashboard/jobs/99999/analyze")
             assert r.status_code == 404
     finally:
         app.dependency_overrides.pop(get_light_client, None)
-        app.dependency_overrides.pop(get_heavy_client, None)
 
 
 def test_resume_upload_with_fake_llm_merges_experience_and_fills_profile():
@@ -497,11 +494,11 @@ def test_interview_full_round_trip_updates_background_notes():
 
 
 def _seed_jd_with_score(client) -> str:
-    """建一条已经跑过 /analyze 的 JD，返回它的详情页 URL。"""
-    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE)])
-    fake_heavy = FakeLLMClient(responses=[dict(FAKE_SCORING_RESPONSE)])
+    """建一条已经跑过 /analyze 的 JD，返回它的详情页 URL。JD 分析两步都走
+    轻量模型槽位（见 test_analyze_end_to_end_with_fake_llm_produces_deterministic_score
+    的说明），按调用顺序给同一个 FakeLLMClient 预置两条响应。"""
+    fake_light = FakeLLMClient(responses=[dict(FAKE_JD_EXTRACTION_RESPONSE), dict(FAKE_SCORING_RESPONSE)])
     app.dependency_overrides[get_light_client] = lambda: fake_light
-    app.dependency_overrides[get_heavy_client] = lambda: fake_heavy
     try:
         create = client.post(
             "/dashboard/jobs",
@@ -516,7 +513,6 @@ def _seed_jd_with_score(client) -> str:
         client.post(f"{jd_url}/analyze")
     finally:
         app.dependency_overrides.pop(get_light_client, None)
-        app.dependency_overrides.pop(get_heavy_client, None)
     return jd_url
 
 

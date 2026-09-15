@@ -705,10 +705,11 @@ def test_claimed_skill_does_not_affect_scoring(db_session):
         "plus_skills_matched": [], "strengths": ["经验对口"], "weaknesses": ["缺 Spark 经验"],
     }
 
-    # 第一次打分：还没有任何认领技能
-    light1 = FakeLLMClient(responses=[dict(canned_jd_parse)])
-    heavy1 = FakeLLMClient(responses=[dict(canned_score)])
-    score_before = analyze_jd(db_session, jd.id, light1, heavy1)
+    # 第一次打分：还没有任何认领技能。JD 分析（解析+打分）两步都走轻量模型
+    # 槽位（打磨阶段用户反馈修复，见 analysis.analyze_jd 的说明），按调用
+    # 顺序预置两条响应。
+    light1 = FakeLLMClient(responses=[dict(canned_jd_parse), dict(canned_score)])
+    score_before = analyze_jd(db_session, jd.id, light1)
     total_before = score_before.total_score
 
     # 认领一条 Spark 技能（模拟用户在简历重制里确认了这条延伸建议）
@@ -721,9 +722,8 @@ def test_claimed_skill_does_not_affect_scoring(db_session):
 
     # 用完全相同的 canned 输入重新打分：分数必须和之前一模一样，
     # 不能因为多了一条 claimed_skill 就变化。
-    light2 = FakeLLMClient(responses=[dict(canned_jd_parse)])
-    heavy2 = FakeLLMClient(responses=[dict(canned_score)])
-    score_after = analyze_jd(db_session, jd.id, light2, heavy2)
+    light2 = FakeLLMClient(responses=[dict(canned_jd_parse), dict(canned_score)])
+    score_after = analyze_jd(db_session, jd.id, light2)
 
     assert score_after.total_score == total_before
     assert score_after.skill_fit_score == score_before.skill_fit_score

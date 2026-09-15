@@ -2,7 +2,7 @@
 {% block title %}模型配置 - JobPilot{% endblock %}
 {% block content %}
 <h1>模型配置</h1>
-<p class="muted">两个独立槽位：轻量模型用于简单的信息抽取（画像/JD 结构化），重量模型用于打分等更复杂的语义判断。只要是 OpenAI 兼容的 Chat Completions 接口都可以填（base_url 填到 /v1 这一级，比如 https://api.openai.com/v1）。</p>
+<p class="muted">两个独立槽位：轻量模型用于简单的信息抽取和判断（画像/JD 结构化解析、JD 匹配打分），重量模型只用在简历重制阶段需要创造性改写/延伸的地方（重组贡献句、生成技能延伸建议）。只要是 OpenAI 兼容的 Chat Completions 接口都可以填（base_url 填到 /v1 这一级，比如 https://api.openai.com/v1）。</p>
 
 {% for slot in ['light', 'heavy'] %}
 <div class="card">

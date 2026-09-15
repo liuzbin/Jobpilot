@@ -21,7 +21,56 @@ function _textOf(el) {
   return text || null;
 }
 
-function _firstMatch(doc, selectors) {
+// 标题/公司名/元信息行这些字段本来就应该是单行文本，`_textOf` 把内部所有
+// 空白（包括换行）压成一个空格是故意的。但 JD 正文（`#job-details` 之类）
+// 是多段落、多条 bullet 的富文本，如果也套用同一个函数,原本用 <p>/<br>/<li>
+// 分隔的段落和条目会被压缩成一整行看不出结构的文字——这是打磨阶段用户反馈
+// "JD 在页面里挤成一坨"的根因（见 docs/DEVELOPMENT_LOG.md 对应章节）。
+// `_blockTextOf` 专门给 JD 正文这类字段用：按块级标签（p/div/li/br/heading
+// 等）切分成一行一段,块内部的空白仍然按 `_textOf` 一样的规则合并,只是块与
+// 块之间用换行分开,不再是同一个空格分隔的整段文字；行内标签（span/strong/a
+// 等）不会触发换行，不会把一句话拆碎。
+const _BLOCK_TAGS = new Set([
+  "P", "DIV", "LI", "UL", "OL", "BR", "H1", "H2", "H3", "H4", "H5", "H6", "TR", "BLOCKQUOTE",
+]);
+
+function _blockTextOf(el) {
+  if (!el) return null;
+  const lines = [];
+  let current = "";
+
+  function pushLine() {
+    const trimmed = current.replace(/[ \t\r\n]+/g, " ").trim();
+    if (trimmed) lines.push(trimmed);
+    current = "";
+  }
+
+  function walk(node) {
+    if (node.nodeType === 3) {
+      // TEXT_NODE：jsdom / 真实浏览器都支持这个常量值，不依赖 Node 全局对象
+      current += node.textContent;
+      return;
+    }
+    if (node.nodeType !== 1) return; // 只关心文本节点和元素节点
+    const tag = node.tagName;
+    if (tag === "BR") {
+      pushLine();
+      return;
+    }
+    const isBlock = _BLOCK_TAGS.has(tag);
+    if (isBlock) pushLine();
+    const children = node.childNodes || [];
+    for (let i = 0; i < children.length; i += 1) walk(children[i]);
+    if (isBlock) pushLine();
+  }
+
+  walk(el);
+  pushLine();
+  return lines.length ? lines.join("\n") : null;
+}
+
+function _firstMatch(doc, selectors, textFn) {
+  const extract = textFn || _textOf;
   for (const sel of selectors) {
     let el;
     try {
@@ -29,7 +78,7 @@ function _firstMatch(doc, selectors) {
     } catch (e) {
       continue; // 选择器语法在某些极端 DOM 实现下出错也不应该让整个抓取崩掉
     }
-    const text = _textOf(el);
+    const text = extract(el);
     if (text) return text;
   }
   return null;
@@ -86,7 +135,7 @@ function extractLinkedInJob(doc, locationHref) {
   const title = _firstMatch(doc, TITLE_SELECTORS);
   const company = _firstMatch(doc, COMPANY_SELECTORS);
   const metaLineRaw = _firstMatch(doc, META_LINE_SELECTORS);
-  const descriptionRaw = _firstMatch(doc, DESCRIPTION_SELECTORS);
+  const descriptionRaw = _firstMatch(doc, DESCRIPTION_SELECTORS, _blockTextOf);
 
   let sourceUrl = locationHref || null;
   const canonical = doc.querySelector('link[rel="canonical"]');
@@ -104,5 +153,5 @@ function extractLinkedInJob(doc, locationHref) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { extractLinkedInJob };
+  module.exports = { extractLinkedInJob, _blockTextOf };
 }

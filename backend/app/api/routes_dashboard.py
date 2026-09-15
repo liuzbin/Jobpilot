@@ -709,15 +709,17 @@ def job_analyze(
     jd_id: int,
     db: Session = Depends(get_db),
     light_client: LLMClient | None = Depends(get_light_client),
-    heavy_client: LLMClient | None = Depends(get_heavy_client),
 ) -> RedirectResponse:
-    if light_client is None or heavy_client is None:
-        missing = "轻量" if light_client is None else "重量"
+    # 打磨阶段用户反馈修复：JD 分析（结构化解析 + 打分）之前打分那一步走的是
+    # 重量模型槽位，两次调用顺序执行、且打分那次 prompt 偏大，用户反馈"感觉
+    # 很慢"，也不符合他"除了简历重制都应该是轻量模型"的预期，确认后改成两步
+    # 都只依赖轻量模型槽位（见 app.services.analysis.analyze_jd 的说明）。
+    if light_client is None:
         return _redirect_with_flash(
-            f"/dashboard/jobs/{jd_id}", f"{missing}模型还没配置，请先到模型配置页面填写", error=True
+            f"/dashboard/jobs/{jd_id}", "轻量模型还没配置，请先到模型配置页面填写", error=True
         )
     try:
-        analyze_jd(db, jd_id, light_client, heavy_client)
+        analyze_jd(db, jd_id, light_client)
     except JDNotFoundError:
         raise HTTPException(status_code=404, detail="JD not found")
     except Exception as exc:  # noqa: BLE001

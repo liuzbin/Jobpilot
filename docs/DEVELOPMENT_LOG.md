@@ -713,3 +713,27 @@ Phase 4 补充版本的 `_run_silent_install` 用 `subprocess.run([installer_pat
 **遗留**：插件侧（侧边栏"添加 LinkedIn profile 到 JobPilot"UI、导航到目标 tab、
 纯 DOM 抓取的内容脚本 `linkedin_profile_parser.js`、background 转发逻辑）还没
 做，是下一个阶段。
+
+---
+
+## 打磨阶段用户反馈修复：JD 分析改用纯轻量模型 + LinkedIn 抓取保留 JD 排版结构（2026-09-15）
+
+**背景**：用户在确认上一阶段（LinkedIn 画像导入后端部分）后追加了三点反馈，本次先处理其中前两点（第三点"简历生成品控 + 复用用户提供的 MD 简历模板"按用户明确的优先级排在下一阶段，本次不动 `resume_tailor.py` 的生成 prompt 和模板）：
+
+1. **"除了简历重制，其他部分都应该访问轻量模型，但目前页面分析 JD 很慢"**：先用只读方式排查，确认这不是 bug，而是 `analyze_jd` 从 Phase 1 起就有的原始设计（对应本文档 5.2 节：技能契合度语义判断故意走重量模型，用意是让这一步语义判断更细腻）——JD 结构化解析 + 打分两步顺序调用，且打分这步 prompt 里带着完整画像 JSON + 完整 JD 原文，两个因素叠加导致延迟明显。就"保留重量模型精简 prompt" vs "打分也换成轻量模型" vs "不改代码"三个选项征求用户意见，用户选择**打分也换成轻量模型**：JD 分析这个场景对时效性要求更高（浏览职位时会被频繁触发），愿意用一定的语义判断精细度换响应速度；简历重制阶段真正需要重量模型做创造性改写的地方不受影响。
+2. **"页面的 JD 如果带有某种格式，最好保留，否则文字挤成一坨看不出结构"**：排查确认是插件 LinkedIn 抓取的真 bug（不是渲染问题——Dashboard 模板 `job_detail.html` 的 `<pre style="white-space:pre-wrap">` 一直是对的，后端 `jd_ingest.create_jd` 也一直原样存 `description_raw`）：根因是 `linkedin_parser.js` 的 `_textOf` 把所有空白（含换行）都压成一个空格，这对标题/公司名这类单行字段是对的，但复用到 JD 正文这种多段落富文本字段上就会把 `<p>`/`<li>` 分隔的结构全部抹平。用户确认后先修这个 bug（排在简历品控之前）。
+
+**实现**：
+
+- `app/services/analysis.py`：`analyze_jd` 不再接收 `heavy_client` 参数，`run_scoring_with_llm` 和 `MatchScore.model_used` 都改用 `light_client`。
+- `app/api/routes_dashboard.py`：`job_analyze` 路由的依赖从 `get_heavy_client` 改成只用 `get_light_client`（`get_heavy_client` 这个 import 在文件里继续保留，`job_tailor_draft` 生成简历那条路径还要用）。
+- `app/templates/job_detail.html` / `models.html`：两处提示文案同步更新——"需要先在模型配置页面填好轻量/重量两个槽位" 改成只提轻量模型；模型配置页顶部对重量模型用途的说明改成"只用在简历重制阶段需要创造性改写/延伸的地方"。
+- `docs/JobPilot_实施方案.md` 5.2 节补充了这次改动的说明（原始设计意图 + 改动原因 + 影响范围），不删除对原始设计的记录。
+- `extension/content_scripts/linkedin_parser.js`：新增 `_blockTextOf`，专门给 JD 正文这类字段用——按块级标签（`p`/`div`/`li`/`ul`/`ol`/`br`/`h1`-`h6`/`tr`/`blockquote`）在标签边界处切成一行一段，块内部空白仍按 `_textOf` 一样的规则合并成单个空格；行内标签（`span`/`strong`/`a` 等）不触发换行，不会把一句被内联标签包裹的话拆碎。`_firstMatch` 改成可传入自定义文本提取函数（默认仍是 `_textOf`，标题/公司名/元信息行这些单行字段不受影响），JD 正文的 `DESCRIPTION_SELECTORS` 改成传 `_blockTextOf`。
+- `extension/content_scripts/linkedin_parser.test.js`：新增 3 个测试——多段落+bullet 列表结构下正确按行切分且行内标签不拆句子、单容器纯文本（没有块级子标签）时行为和以前完全一样（合并成单行，保证向后兼容不影响三份已有的真实页面布局 fixture）、`_blockTextOf` 对 `<br>`/连续空白/纯空白元素的兜底处理。
+
+**测试改动说明**：分析 JD 现在两步都发到同一个 `light_client`，测试里原来分别给 `fake_light`/`fake_heavy` 各准备一条响应的写法，改成给同一个 `FakeLLMClient` 按调用顺序预置两条响应（`test_dashboard.py` 的 `_seed_jd_with_score` 辅助函数 + 两个直接测试、`test_resume_tailor.py` 里两处直接调用 `analyze_jd` 的地方）。
+
+**验证结果**：全量 359 个 pytest 用例（数量不变，本次没有新增/删除测试用例，只是调整了已有用例的 mock 方式）在云端沙盒和用户设备侧独立 Windows 环境两边分批跑通；插件测试 `npm test`（33 个用例，含新增的 3 个）和 `npm run check-permissions` 均通过。
+
+**遗留**：用户第三点反馈（参考上传的简历生成提示词做生成品控 + 复用其中的 MD 简历模板）按用户明确的优先级排在下一阶段；LinkedIn 插件侧 UI（侧边栏抓取入口）排在这之后。
